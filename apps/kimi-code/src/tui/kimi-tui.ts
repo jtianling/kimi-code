@@ -101,6 +101,7 @@ import { AuthFlowController } from './controllers/auth-flow';
 import { BtwPanelController } from './controllers/btw-panel';
 import { ClipboardImageHintController } from './controllers/clipboard-image-hint';
 import { EditorKeyboardController } from './controllers/editor-keyboard';
+import { ServerTurnObserver } from './controllers/server-turn-observer';
 import { SessionEventHandler } from './controllers/session-event-handler';
 import { SessionReplayRenderer } from './controllers/session-replay';
 import { StreamingUIController } from './controllers/streaming-ui';
@@ -333,6 +334,7 @@ export class KimiTUI {
   readonly sessionReplay: SessionReplayRenderer;
   readonly tasksBrowserController: TasksBrowserController;
   readonly editorKeyboard: EditorKeyboardController;
+  readonly serverTurnObserver: ServerTurnObserver;
 
   /** Timer that auto-clears the one-shot "moved to background" footer hint. */
   private detachHintClearTimer: ReturnType<typeof setTimeout> | undefined;
@@ -413,6 +415,7 @@ export class KimiTUI {
     this.sessionReplay = new SessionReplayRenderer(this);
     this.tasksBrowserController = new TasksBrowserController(this);
     this.editorKeyboard = new EditorKeyboardController(this, this.imageStore);
+    this.serverTurnObserver = new ServerTurnObserver(this);
     this.editorKeyboard.install();
     this.buildLayout();
   }
@@ -829,6 +832,7 @@ export class KimiTUI {
     // stop() returns (or leak when stop() runs without process.exit).
     this.tasksBrowserController.close();
     this.btwPanelController.clear();
+    this.serverTurnObserver.dispose();
     this.stopActivitySpinner();
     this.streamingUI.disposeActiveCompactionBlock();
     this.streamingUI.resetToolUi();
@@ -1348,7 +1352,8 @@ export class KimiTUI {
     if (
       this.deferUserMessages ||
       this.state.appState.streamingPhase !== 'idle' ||
-      this.state.appState.isCompacting
+      this.state.appState.isCompacting ||
+      this.serverTurnObserver.externalTurnActive
     ) {
       this.enqueueMessage(input, options);
       return;
@@ -1357,7 +1362,11 @@ export class KimiTUI {
   }
 
   steerMessage(session: Session, input: readonly SteerInputItem[]): void {
-    if (this.deferUserMessages || this.state.appState.isCompacting) {
+    if (
+      this.deferUserMessages ||
+      this.state.appState.isCompacting ||
+      this.serverTurnObserver.externalTurnActive
+    ) {
       for (const item of input) {
         this.enqueueMessage(item.text, item);
       }
@@ -1469,6 +1478,7 @@ export class KimiTUI {
     if (busyChanged) {
       this.updateQueueDisplay();
       this.sessionEventHandler.retryQueuedGoalPromotion();
+      this.serverTurnObserver.onHostBusyChanged();
     }
     if (additionalDirsChanged) this.setupAutocomplete();
     this.state.ui.requestRender();
@@ -1529,6 +1539,7 @@ export class KimiTUI {
     this.harness.setTelemetryContext({ sessionId: session.id });
     this.registerSessionHandlers(session);
     this.syncAdditionalDirs(session);
+    this.serverTurnObserver.setSessionId(session.id);
   }
 
   async syncRuntimeState(session: Session = this.requireSession()): Promise<void> {
@@ -1597,6 +1608,7 @@ export class KimiTUI {
 
   private unloadCurrentSession(reason: string): Session | undefined {
     const previous = this.session;
+    this.serverTurnObserver.setSessionId(undefined);
     this.sessionEventUnsubscribe?.();
     this.sessionEventUnsubscribe = undefined;
     this.clearReverseRpcPanels();
@@ -1767,6 +1779,52 @@ export class KimiTUI {
     }
     this.showStatus(statusMessage);
     void this.showSessionWarnings(session);
+  }
+
+  /**
+   * Reload the active session from disk after a server-driven (external) turn
+   * and re-render the transcript, so the injected turn becomes visible and the
+   * in-process engine context includes it. Returns false when the TUI is busy
+   * (the caller retries on the next idle transition) or the reload failed.
+   */
+  async refreshSessionFromServerTurn(): Promise<boolean> {
+    const session = this.session;
+    if (session === undefined) return false;
+    if (
+      this.state.appState.streamingPhase !== 'idle' ||
+      this.state.appState.isReplaying ||
+      this.state.appState.isCompacting
+    ) {
+      return false;
+    }
+    try {
+      await session.reloadSession();
+    } catch (error) {
+      this.showStatus(
+        `Failed to reload session after external activity: ${formatErrorMessage(error)}`,
+        'warning',
+      );
+      return false;
+    }
+    this.sessionEventUnsubscribe?.();
+    this.sessionEventUnsubscribe = undefined;
+    this.clearReverseRpcPanels();
+    session.setApprovalHandler(undefined);
+    session.setQuestionHandler(undefined);
+    this.approvalController.cancelAll('refreshing session');
+    this.questionController.cancelAll('refreshing session');
+    this.resetSessionRuntime();
+    this.registerSessionHandlers(session);
+    await this.syncRuntimeState(session);
+    this.clearTranscriptAndRedraw();
+    try {
+      await this.sessionReplay.hydrateFromReplay(session);
+    } finally {
+      this.sessionEventHandler.startSubscription();
+    }
+    this.showStatus('Session updated by another client; view and context refreshed.');
+    this.drainOneQueuedMessage();
+    return true;
   }
 
   async createNewSession(): Promise<void> {

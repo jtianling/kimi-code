@@ -32,6 +32,15 @@ export const FLAG_DEFINITIONS = [
     default: false,
     surface: 'core',
   },
+  {
+    id: 'tui-server-sync',
+    title: 'TUI server-turn sync',
+    description:
+      'Subscribe the interactive TUI to a local kimi server (/api/v1/ws) so turns driven on the open session by external clients (REST prompt injection) surface in the TUI and reload its context when they finish.',
+    env: 'KIMI_CODE_EXPERIMENTAL_TUI_SERVER_SYNC',
+    default: false,
+    surface: 'tui',
+  },
 ] as const satisfies readonly FlagDefinitionInput[];
 
 /** Literal union of registered flag ids. */
