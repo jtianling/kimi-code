@@ -54,6 +54,7 @@ function makeHost() {
   };
   const statuses: string[] = [];
   const refresh = vi.fn(async () => true);
+  const drain = vi.fn();
   const host = {
     harness: { homeDir: '/tmp/kimi-home' },
     session: { id: 'sess-1' } as unknown as ServerTurnObserverHost['session'],
@@ -62,8 +63,9 @@ function makeHost() {
       statuses.push(message);
     },
     refreshSessionFromServerTurn: refresh,
+    drainOneQueuedMessage: drain,
   };
-  return { host: host as unknown as ServerTurnObserverHost, appState, statuses, refresh };
+  return { host: host as unknown as ServerTurnObserverHost, appState, statuses, refresh, drain };
 }
 
 function makeObserver(host: ServerTurnObserverHost) {
@@ -236,6 +238,48 @@ describe('ServerTurnObserver', () => {
       session_ids: ['sess-1'],
       cursors: { 'sess-1': { seq: 7, epoch: 'e1' } },
     });
+    observer.dispose();
+  });
+
+  it('nudges about the Esc escape hatch after five minutes of one external turn', async () => {
+    const { host, statuses } = makeHost();
+    const observer = makeObserver(host);
+    const ws = await connect(observer);
+    ackSubscribe(ws, { accepted: ['sess-1'], cursors: { 'sess-1': { seq: 5, epoch: 'e1' } } });
+
+    ws.receive(envelope('turn.started'));
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(statuses.some((s) => s.includes('press Esc to unlock input'))).toBe(true);
+
+    ws.receive(envelope('turn.ended', { seq: 12 }));
+    await vi.advanceTimersByTimeAsync(0);
+    observer.dispose();
+  });
+
+  it('Esc releases the gate, drains a queued message, and re-engages next turn', async () => {
+    const { host, statuses, drain, refresh } = makeHost();
+    const observer = makeObserver(host);
+    const ws = await connect(observer);
+    ackSubscribe(ws, { accepted: ['sess-1'], cursors: { 'sess-1': { seq: 5, epoch: 'e1' } } });
+
+    expect(observer.releaseGate()).toBe(false);
+
+    ws.receive(envelope('turn.started'));
+    expect(observer.externalTurnActive).toBe(true);
+    expect(observer.releaseGate()).toBe(true);
+    expect(observer.externalTurnActive).toBe(false);
+    expect(drain).toHaveBeenCalledTimes(1);
+    expect(statuses.some((s) => s.includes('gate released'))).toBe(true);
+    expect(observer.releaseGate()).toBe(false);
+
+    // The still-running turn ends: refresh happens as usual.
+    ws.receive(envelope('turn.ended', { seq: 12 }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    // A fresh external turn re-engages the gate.
+    ws.receive(envelope('turn.started', { seq: 14 }));
+    expect(observer.externalTurnActive).toBe(true);
     observer.dispose();
   });
 

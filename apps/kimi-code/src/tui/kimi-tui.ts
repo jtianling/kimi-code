@@ -973,6 +973,10 @@ export class KimiTUI {
     void slashCommands.handlePlanCommand(this, next ? 'on' : 'off');
   }
 
+  releaseExternalTurnGate(): boolean {
+    return this.serverTurnObserver.releaseGate();
+  }
+
   handleInputModeChange(mode: 'prompt' | 'bash'): void {
     this.setAppState({ inputMode: mode });
     this.updateEditorBorderHighlight();
@@ -1112,7 +1116,7 @@ export class KimiTUI {
     }
   }
 
-  private drainOneQueuedMessage(): void {
+  drainOneQueuedMessage(): void {
     const item = this.shiftQueuedMessage();
     if (item === undefined) return;
     const session = this.session;

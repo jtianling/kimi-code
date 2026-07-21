@@ -36,6 +36,8 @@ const SUBSCRIBE_RETRY_MS = 3_000;
 /** Instance-registry re-scan cadence while no server is running. */
 const DISCOVER_RETRY_MS = 15_000;
 const RECONNECT_MAX_MS = 30_000;
+/** After this long in one external turn, remind the user of the Esc escape hatch. */
+const EXTERNAL_TURN_NUDGE_MS = 5 * 60_000;
 
 /** Minimal structural view of the WHATWG WebSocket client (Node >= 22 global). */
 export interface WsClient {
@@ -82,6 +84,8 @@ export interface ServerTurnObserverHost {
   showStatus(message: string, color?: 'warning'): void;
   /** Reload the session from disk and re-render; false = busy or failed. */
   refreshSessionFromServerTurn(): Promise<boolean>;
+  /** Release one queued message (used after the input gate is released). */
+  drainOneQueuedMessage(): void;
 }
 
 export class ServerTurnObserver {
@@ -97,7 +101,10 @@ export class ServerTurnObserver {
   private msgSeq = 0;
   private reconnectAttempts = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private nudgeTimer: ReturnType<typeof setTimeout> | undefined;
   private externalActive = false;
+  /** User pressed Esc to opt out of queueing for the current external turn. */
+  private gateReleased = false;
   private pendingRefresh = false;
   private refreshing = false;
   private disposed = false;
@@ -107,9 +114,26 @@ export class ServerTurnObserver {
     private readonly deps: ServerTurnObserverDeps = {},
   ) {}
 
-  /** True while a server-driven turn is running on the active session. */
+  /** True while a server-driven turn is running and the input gate holds. */
   get externalTurnActive(): boolean {
-    return this.externalActive;
+    return this.externalActive && !this.gateReleased;
+  }
+
+  /**
+   * Esc escape hatch: stop queueing input for the current external turn (the
+   * turn keeps running server-side and may then run concurrently with the
+   * user's own turns). Returns true when there was a gate to release.
+   */
+  releaseGate(): boolean {
+    if (!this.externalActive || this.gateReleased) return false;
+    this.gateReleased = true;
+    this.clearNudge();
+    this.host.showStatus(
+      'External-turn input gate released; new input may run concurrently with the external turn.',
+      'warning',
+    );
+    if (this.hostIdle()) this.host.drainOneQueuedMessage();
+    return true;
   }
 
   /** Attach to a session (undefined detaches). Resets all connection state. */
@@ -156,6 +180,7 @@ export class ServerTurnObserver {
         // best effort — the socket may already be closed.
       }
     }
+    this.clearNudge();
     this.helloDone = false;
     this.accepted = false;
     this.sawColdSession = false;
@@ -163,6 +188,7 @@ export class ServerTurnObserver {
     this.pendingSubscribeId = undefined;
     this.reconnectAttempts = 0;
     this.externalActive = false;
+    this.gateReleased = false;
     this.pendingRefresh = false;
   }
 
@@ -352,9 +378,11 @@ export class ServerTurnObserver {
     if (frame.type === 'turn.started') {
       if (!this.externalActive) {
         this.externalActive = true;
+        this.gateReleased = false;
         this.host.showStatus(
           'Session is being driven by another client (server); input will be queued.',
         );
+        this.scheduleNudge();
       }
       return;
     }
@@ -362,7 +390,29 @@ export class ServerTurnObserver {
       // A turn.ended without a seen turn.started (subscribed mid-turn) still
       // means the on-disk session moved — refresh either way.
       this.externalActive = false;
+      this.gateReleased = false;
+      this.clearNudge();
       this.requestRefresh();
+    }
+  }
+
+  /** One reminder per external turn that Esc unlocks the input gate. */
+  private scheduleNudge(): void {
+    this.clearNudge();
+    this.nudgeTimer = setTimeout(() => {
+      this.nudgeTimer = undefined;
+      if (!this.externalActive || this.gateReleased) return;
+      this.host.showStatus(
+        'External turn still running after 5 minutes; press Esc to unlock input (it may then run concurrently).',
+        'warning',
+      );
+    }, EXTERNAL_TURN_NUDGE_MS);
+  }
+
+  private clearNudge(): void {
+    if (this.nudgeTimer !== undefined) {
+      clearTimeout(this.nudgeTimer);
+      this.nudgeTimer = undefined;
     }
   }
 

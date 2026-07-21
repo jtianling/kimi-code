@@ -50,6 +50,8 @@ export interface EditorKeyboardHost {
   cancelRunningShellCommand(): void;
   hideSessionPicker(): void;
   openUndoSelector(): void;
+  /** Release the external-turn input gate; true when Esc was consumed by it. */
+  releaseExternalTurnGate?(): boolean;
   stop(exitCode?: number): Promise<void>;
   handlePlanToggle(next: boolean): void;
   handleInputModeChange(mode: 'prompt' | 'bash'): void;
@@ -199,6 +201,10 @@ export class EditorKeyboardController {
       }
       if (host.state.appState.streamingPhase !== 'idle') {
         this.cancelCurrentStream();
+        this.clearPendingUndoEsc();
+        return;
+      }
+      if (host.releaseExternalTurnGate?.() === true) {
         this.clearPendingUndoEsc();
         return;
       }
