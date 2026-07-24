@@ -345,8 +345,13 @@ export class ServerTurnObserver {
           };
         }
         // The gap contents are unknowable; with an established baseline the
-        // safe move is one refresh from disk.
-        if (hadBaseline) this.requestRefresh();
+        // safe move is one refresh from disk. The refresh clears the
+        // transcript and disposes the live spinner — drop the handle so the
+        // next intermediate event re-creates the progress line.
+        if (hadBaseline) {
+          this.progress = undefined;
+          this.requestRefresh();
+        }
         return;
       }
       default:
@@ -478,9 +483,15 @@ export class ServerTurnObserver {
   }
 
   private setProgressLabel(activity: string): void {
-    if (this.progress === undefined) return;
     const step = this.progressStep > 0 ? ` · step ${String(this.progressStep)}` : '';
-    this.progress.setLabel(`External turn${step} · ${activity}`);
+    const label = `External turn${step} · ${activity}`;
+    if (this.progress !== undefined) {
+      this.progress.setLabel(label);
+      return;
+    }
+    // A mid-turn refresh (resync) disposed the previous line; re-create it.
+    if (!this.externalActive) return;
+    this.progress = this.host.showProgressSpinner(label);
   }
 
   /** Finalize the progress line; `ok` overrides the reason-based tone. */
@@ -490,7 +501,8 @@ export class ServerTurnObserver {
     this.progress = undefined;
     const tools = this.progressTools;
     progress.stop({
-      ok: ok ?? (reason === undefined || reason === 'completed'),
+      // Only genuine failures get the error tone; cancelled is neutral.
+      ok: ok ?? (reason !== 'failed' && reason !== 'blocked'),
       label: `External turn ${reason ?? 'ended'} (${String(tools)} tool call${tools === 1 ? '' : 's'}).`,
     });
   }

@@ -353,6 +353,52 @@ describe('ServerTurnObserver', () => {
     observer.dispose();
   });
 
+  it('re-creates the progress line after a mid-turn resync refresh', async () => {
+    const { host, spinner, refresh } = makeHost();
+    const observer = makeObserver(host);
+    const ws = await connect(observer);
+    ackSubscribe(ws, { accepted: ['sess-1'], cursors: { 'sess-1': { seq: 5, epoch: 'e1' } } });
+
+    ws.receive(envelope('turn.started'));
+    ws.receive(envelope('tool.call.started', { payload: { name: 'Bash', args: {} } }));
+    expect(spinner.starts).toBe(1);
+
+    // The refresh clears the transcript and disposes the live spinner.
+    ws.receive({
+      type: 'resync_required',
+      payload: { session_id: 'sess-1', current_seq: 20, epoch: 'e2' },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(observer.externalTurnActive).toBe(true);
+
+    // The next intermediate event resurrects the line instead of updating a
+    // disposed component; the tool count survives.
+    ws.receive(envelope('tool.call.started', { seq: 21, payload: { name: 'Read', args: {} } }));
+    expect(spinner.starts).toBe(2);
+    expect(spinner.labels.at(-1)).toBe('External turn · Read…');
+
+    ws.receive(envelope('turn.ended', { seq: 22, payload: { reason: 'completed' } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(spinner.stops).toEqual([{ ok: true, label: 'External turn completed (2 tool calls).' }]);
+    observer.dispose();
+  });
+
+  it('finalizes a cancelled turn with a neutral tone', async () => {
+    const { host, spinner } = makeHost();
+    const observer = makeObserver(host);
+    const ws = await connect(observer);
+    ackSubscribe(ws, { accepted: ['sess-1'], cursors: { 'sess-1': { seq: 5, epoch: 'e1' } } });
+
+    ws.receive(envelope('turn.started'));
+    ws.receive(envelope('turn.ended', { seq: 12, payload: { reason: 'cancelled' } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(spinner.stops).toEqual([
+      { ok: true, label: 'External turn cancelled (0 tool calls).' },
+    ]);
+    observer.dispose();
+  });
+
   it('dispose closes the socket and stops all timers', async () => {
     const { host } = makeHost();
     const observer = makeObserver(host);
