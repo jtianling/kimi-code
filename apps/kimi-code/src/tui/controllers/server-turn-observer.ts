@@ -23,13 +23,15 @@
  */
 
 import type { Session } from '@moonshot-ai/kimi-code-sdk';
-import { readFile } from 'node:fs/promises';
+import { appendFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { isExperimentalFlagEnabled } from '../commands/experimental-flags';
 import type { AppState } from '../types';
 
 const SERVER_SYNC_FLAG = 'tui-server-sync';
+/** Set to enable the append-only diagnostic log at `<home>/tui-server-sync-debug.log`. */
+const DEBUG_ENV = 'KIMI_TUI_SERVER_SYNC_DEBUG';
 const WS_BEARER_PROTOCOL_PREFIX = 'kimi-code.bearer.';
 /** Cold-session subscribe retry cadence (one small WS control frame). */
 const SUBSCRIBE_RETRY_MS = 3_000;
@@ -114,6 +116,20 @@ export class ServerTurnObserver {
     private readonly deps: ServerTurnObserverDeps = {},
   ) {}
 
+  /**
+   * Append-only diagnostic trail, enabled via the {@link DEBUG_ENV} env var.
+   * The observer is otherwise fully silent, which made a live incident
+   * (connected + hello'd, subscription never established) unattributable —
+   * every state transition worth forensics goes through here.
+   */
+  private debug(message: string): void {
+    if (process.env[DEBUG_ENV] === undefined || process.env[DEBUG_ENV] === '') return;
+    const line = `${new Date().toISOString()} pid=${String(process.pid)} ${message}\n`;
+    void appendFile(join(this.host.harness.homeDir, 'tui-server-sync-debug.log'), line).catch(
+      () => {},
+    );
+  }
+
   /** True while a server-driven turn is running and the input gate holds. */
   get externalTurnActive(): boolean {
     return this.externalActive && !this.gateReleased;
@@ -141,7 +157,12 @@ export class ServerTurnObserver {
     if (this.disposed || sessionId === this.sessionId) return;
     this.teardown();
     this.sessionId = sessionId;
-    if (sessionId === undefined || !isExperimentalFlagEnabled(SERVER_SYNC_FLAG)) return;
+    if (sessionId === undefined) return;
+    if (!isExperimentalFlagEnabled(SERVER_SYNC_FLAG)) {
+      this.debug(`setSessionId ${sessionId}: flag disabled, observer inert`);
+      return;
+    }
+    this.debug(`setSessionId ${sessionId}: scheduling discovery`);
     this.schedule(0, () => this.discover());
   }
 
@@ -212,12 +233,16 @@ export class ServerTurnObserver {
     }
     if (this.disposed || this.sessionId !== sessionId) return;
     if (target === undefined) {
+      this.debug('discover: no live server instance, retrying');
       this.schedule(DISCOVER_RETRY_MS, () => void this.discover());
       return;
     }
     const token = await (this.deps.readToken ?? readHomeToken)(homeDir);
     if (this.disposed || this.sessionId !== sessionId) return;
     const host = target.host === '0.0.0.0' || target.host === '::' ? '127.0.0.1' : target.host;
+    this.debug(
+      `discover: connecting to ${host}:${String(target.port)} token=${token !== undefined ? 'yes' : 'no'}`,
+    );
     this.connect(`ws://${host}:${String(target.port)}/api/v1/ws`, token);
   }
 
@@ -256,6 +281,7 @@ export class ServerTurnObserver {
     };
     ws.onclose = () => {
       if (this.ws !== ws) return;
+      this.debug('ws closed, scheduling reconnect');
       this.ws = undefined;
       this.helloDone = false;
       this.accepted = false;
@@ -280,6 +306,7 @@ export class ServerTurnObserver {
     if (this.disposed || typeof frame.type !== 'string') return;
     switch (frame.type) {
       case 'server_hello': {
+        this.debug('server_hello received, sending client_hello + subscribe');
         this.reconnectAttempts = 0;
         this.send({
           type: 'client_hello',
@@ -334,10 +361,12 @@ export class ServerTurnObserver {
       | undefined;
     const accepted = Array.isArray(payload?.accepted) && payload.accepted.includes(sessionId);
     if (!accepted) {
+      this.debug('subscribe ack: not accepted (cold session), retrying');
       this.sawColdSession = true;
       this.schedule(SUBSCRIBE_RETRY_MS, () => this.trySubscribe());
       return;
     }
+    this.debug(`subscribe ack: accepted, cursor=${JSON.stringify(payload?.cursors?.[sessionId])}`);
     this.accepted = true;
     const hadCursor = this.cursor !== undefined;
     const serverCursor = payload?.cursors?.[sessionId];
@@ -376,6 +405,7 @@ export class ServerTurnObserver {
       };
     }
     if (frame.type === 'turn.started') {
+      this.debug('turn.started (external)');
       if (!this.externalActive) {
         this.externalActive = true;
         this.gateReleased = false;
@@ -387,6 +417,7 @@ export class ServerTurnObserver {
       return;
     }
     if (frame.type === 'turn.ended') {
+      this.debug('turn.ended (external), requesting refresh');
       // A turn.ended without a seen turn.started (subscribed mid-turn) still
       // means the on-disk session moved — refresh either way.
       this.externalActive = false;
@@ -444,6 +475,7 @@ export class ServerTurnObserver {
     } finally {
       this.refreshing = false;
     }
+    this.debug(`refresh ${ok ? 'done' : 'deferred (busy or failed)'}`);
     // A refresh that lost a race (host became busy / reload rejected) retries
     // on the next idle transition.
     if (!ok && !this.disposed) this.pendingRefresh = true;
