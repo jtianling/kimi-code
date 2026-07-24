@@ -27,7 +27,7 @@ import { appendFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { isExperimentalFlagEnabled } from '../commands/experimental-flags';
-import type { AppState } from '../types';
+import type { AppState, ProgressSpinnerHandle } from '../types';
 
 const SERVER_SYNC_FLAG = 'tui-server-sync';
 /** Set to enable the append-only diagnostic log at `<home>/tui-server-sync-debug.log`. */
@@ -84,6 +84,8 @@ export interface ServerTurnObserverHost {
     readonly appState: Pick<AppState, 'streamingPhase' | 'isReplaying' | 'isCompacting'>;
   };
   showStatus(message: string, color?: 'warning'): void;
+  /** One-line spinner appended to the transcript; label updates in place. */
+  showProgressSpinner(label: string): ProgressSpinnerHandle;
   /** Reload the session from disk and re-render; false = busy or failed. */
   refreshSessionFromServerTurn(): Promise<boolean>;
   /** Release one queued message (used after the input gate is released). */
@@ -107,6 +109,10 @@ export class ServerTurnObserver {
   private externalActive = false;
   /** User pressed Esc to opt out of queueing for the current external turn. */
   private gateReleased = false;
+  /** Live progress line for the current external turn (step / tool activity). */
+  private progress: ProgressSpinnerHandle | undefined;
+  private progressStep = 0;
+  private progressTools = 0;
   private pendingRefresh = false;
   private refreshing = false;
   private disposed = false;
@@ -202,6 +208,7 @@ export class ServerTurnObserver {
       }
     }
     this.clearNudge();
+    this.stopProgress('detached', true);
     this.helloDone = false;
     this.accepted = false;
     this.sawColdSession = false;
@@ -404,27 +411,88 @@ export class ServerTurnObserver {
         epoch: typeof frame.epoch === 'string' ? frame.epoch : this.cursor?.epoch,
       };
     }
-    if (frame.type === 'turn.started') {
-      this.debug('turn.started (external)');
-      if (!this.externalActive) {
-        this.externalActive = true;
-        this.gateReleased = false;
-        this.host.showStatus(
-          'Session is being driven by another client (server); input will be queued.',
-        );
-        this.scheduleNudge();
+    switch (frame.type) {
+      case 'turn.started': {
+        this.debug('turn.started (external)');
+        this.markExternalTurnActive();
+        return;
       }
-      return;
+      case 'turn.ended': {
+        this.debug('turn.ended (external), requesting refresh');
+        const reason = (frame.payload as { reason?: unknown } | undefined)?.reason;
+        this.stopProgress(typeof reason === 'string' ? reason : undefined);
+        // A turn.ended without a seen turn.started (subscribed mid-turn) still
+        // means the on-disk session moved — refresh either way.
+        this.externalActive = false;
+        this.gateReleased = false;
+        this.clearNudge();
+        this.requestRefresh();
+        return;
+      }
+      // Intermediate turn events double as a mid-turn attach signal: they only
+      // occur while an external turn runs, so a subscribe that lands mid-turn
+      // still raises the gate and the progress line.
+      case 'turn.step.started': {
+        this.markExternalTurnActive();
+        const step = (frame.payload as { step?: unknown } | undefined)?.step;
+        if (typeof step === 'number') this.progressStep = step;
+        this.setProgressLabel('thinking…');
+        return;
+      }
+      case 'turn.step.retrying': {
+        this.markExternalTurnActive();
+        const p = frame.payload as
+          | { nextAttempt?: unknown; maxAttempts?: unknown; errorName?: unknown }
+          | undefined;
+        const attempt =
+          typeof p?.nextAttempt === 'number' && typeof p.maxAttempts === 'number'
+            ? ` ${String(p.nextAttempt)}/${String(p.maxAttempts)}`
+            : '';
+        const error = typeof p?.errorName === 'string' ? `: ${p.errorName}` : '';
+        this.setProgressLabel(`retrying${attempt}${error}…`);
+        return;
+      }
+      case 'tool.call.started': {
+        this.markExternalTurnActive();
+        this.progressTools += 1;
+        const name = (frame.payload as { name?: unknown } | undefined)?.name;
+        this.setProgressLabel(typeof name === 'string' ? `${name}…` : 'tool call…');
+        return;
+      }
+      default:
     }
-    if (frame.type === 'turn.ended') {
-      this.debug('turn.ended (external), requesting refresh');
-      // A turn.ended without a seen turn.started (subscribed mid-turn) still
-      // means the on-disk session moved — refresh either way.
-      this.externalActive = false;
-      this.gateReleased = false;
-      this.clearNudge();
-      this.requestRefresh();
-    }
+  }
+
+  /** Raise the input gate and the progress line for a newly seen external turn. */
+  private markExternalTurnActive(): void {
+    if (this.externalActive) return;
+    this.externalActive = true;
+    this.gateReleased = false;
+    this.progressStep = 0;
+    this.progressTools = 0;
+    this.host.showStatus(
+      'Session is being driven by another client (server); input will be queued.',
+    );
+    this.progress = this.host.showProgressSpinner('External turn · starting…');
+    this.scheduleNudge();
+  }
+
+  private setProgressLabel(activity: string): void {
+    if (this.progress === undefined) return;
+    const step = this.progressStep > 0 ? ` · step ${String(this.progressStep)}` : '';
+    this.progress.setLabel(`External turn${step} · ${activity}`);
+  }
+
+  /** Finalize the progress line; `ok` overrides the reason-based tone. */
+  private stopProgress(reason: string | undefined, ok?: boolean): void {
+    const progress = this.progress;
+    if (progress === undefined) return;
+    this.progress = undefined;
+    const tools = this.progressTools;
+    progress.stop({
+      ok: ok ?? (reason === undefined || reason === 'completed'),
+      label: `External turn ${reason ?? 'ended'} (${String(tools)} tool call${tools === 1 ? '' : 's'}).`,
+    });
   }
 
   /** One reminder per external turn that Esc unlocks the input gate. */

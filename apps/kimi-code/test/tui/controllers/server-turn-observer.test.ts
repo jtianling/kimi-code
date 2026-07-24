@@ -53,6 +53,11 @@ function makeHost() {
     isCompacting: false,
   };
   const statuses: string[] = [];
+  const spinner = {
+    starts: 0,
+    labels: [] as string[],
+    stops: [] as Array<{ ok: boolean; label: string }>,
+  };
   const refresh = vi.fn(async () => true);
   const drain = vi.fn();
   const host = {
@@ -62,10 +67,25 @@ function makeHost() {
     showStatus: (message: string) => {
       statuses.push(message);
     },
+    showProgressSpinner: (label: string) => {
+      spinner.starts += 1;
+      spinner.labels.push(label);
+      return {
+        setLabel: (next: string) => spinner.labels.push(next),
+        stop: (opts: { ok: boolean; label: string }) => spinner.stops.push(opts),
+      };
+    },
     refreshSessionFromServerTurn: refresh,
     drainOneQueuedMessage: drain,
   };
-  return { host: host as unknown as ServerTurnObserverHost, appState, statuses, refresh, drain };
+  return {
+    host: host as unknown as ServerTurnObserverHost,
+    appState,
+    statuses,
+    spinner,
+    refresh,
+    drain,
+  };
 }
 
 function makeObserver(host: ServerTurnObserverHost) {
@@ -280,6 +300,56 @@ describe('ServerTurnObserver', () => {
     // A fresh external turn re-engages the gate.
     ws.receive(envelope('turn.started', { seq: 14 }));
     expect(observer.externalTurnActive).toBe(true);
+    observer.dispose();
+  });
+
+  it('shows a live progress line across step/tool events and finalizes on turn end', async () => {
+    const { host, spinner } = makeHost();
+    const observer = makeObserver(host);
+    const ws = await connect(observer);
+    ackSubscribe(ws, { accepted: ['sess-1'], cursors: { 'sess-1': { seq: 5, epoch: 'e1' } } });
+
+    ws.receive(envelope('turn.started'));
+    expect(spinner.starts).toBe(1);
+
+    ws.receive(envelope('turn.step.started', { payload: { step: 1 } }));
+    expect(spinner.labels.at(-1)).toBe('External turn · step 1 · thinking…');
+
+    ws.receive(envelope('tool.call.started', { payload: { name: 'Bash', args: {} } }));
+    expect(spinner.labels.at(-1)).toBe('External turn · step 1 · Bash…');
+
+    ws.receive(envelope('tool.call.started', { payload: { name: 'Read', args: {} } }));
+    ws.receive(envelope('turn.step.started', { payload: { step: 2 } }));
+    expect(spinner.labels.at(-1)).toBe('External turn · step 2 · thinking…');
+
+    ws.receive(
+      envelope('turn.step.retrying', {
+        payload: { nextAttempt: 2, maxAttempts: 3, errorName: 'ETIMEDOUT' },
+      }),
+    );
+    expect(spinner.labels.at(-1)).toBe('External turn · step 2 · retrying 2/3: ETIMEDOUT…');
+
+    ws.receive(envelope('turn.ended', { seq: 12, payload: { reason: 'completed' } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(spinner.stops).toEqual([{ ok: true, label: 'External turn completed (2 tool calls).' }]);
+    observer.dispose();
+  });
+
+  it('a mid-turn subscribe raises the gate and progress line from a tool event', async () => {
+    const { host, spinner, statuses } = makeHost();
+    const observer = makeObserver(host);
+    const ws = await connect(observer);
+    ackSubscribe(ws, { accepted: ['sess-1'], cursors: { 'sess-1': { seq: 5, epoch: 'e1' } } });
+
+    ws.receive(envelope('tool.call.started', { payload: { name: 'Bash', args: {} } }));
+    expect(observer.externalTurnActive).toBe(true);
+    expect(statuses.some((s) => s.includes('another client'))).toBe(true);
+    expect(spinner.starts).toBe(1);
+    expect(spinner.labels.at(-1)).toBe('External turn · Bash…');
+
+    ws.receive(envelope('turn.ended', { seq: 12, payload: { reason: 'failed' } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(spinner.stops).toEqual([{ ok: false, label: 'External turn failed (1 tool call).' }]);
     observer.dispose();
   });
 
