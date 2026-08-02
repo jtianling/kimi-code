@@ -1,5 +1,5 @@
 /**
- * `cron` domain (L5) — `ISessionCronService` contract.
+ * `cron` domain — `ISessionCronService` contract.
  *
  * Session-level scheduling engine for cron tasks. Owns the live task set
  * (filtered from `ICronTaskPersistence` by `sessionId` tag), the polling timer,
@@ -46,8 +46,8 @@ export interface ISessionCronService {
     tasks: readonly CronTask[],
     renderMissedNotification: (tasks: readonly CronTask[]) => readonly ContentPart[],
   ): Turn | undefined;
-  emitScheduled(task: CronTask): void;
-  emitDeleted(taskId: string): void;
+  emitScheduled(task: CronTask, agentId?: string): void;
+  emitDeleted(taskId: string, agentId?: string): void;
 }
 
 export const ISessionCronService = createDecorator<ISessionCronService>('sessionCronService');

@@ -3,10 +3,7 @@
  *
  * `ReadMediaFile` is only useful when the active model can consume image or
  * video input, so registration is capability-gated here instead of inside the
- * tool (v1 threw a `SkipThisTool` sentinel from the constructor). In
- * production, `AgentMediaToolsRegistrar` (see `mediaToolsRegistrar.ts`) calls
- * `registerMediaTools` and re-runs it whenever the resolved model or its
- * media capabilities change.
+ * tool (v1 threw a `SkipThisTool` sentinel from the constructor).
  *
  * `createVideoUploader` is a thin binder over a `ModelRequester`'s optional
  * `uploadVideo`. Auth is already resolved via the requester's auth-provider
@@ -23,7 +20,8 @@ import type { WorkspaceConfig } from '#/tool/path-access';
 import type { IHostFileSystem } from '#/os/interface/hostFileSystem';
 import type { IHostEnvironment } from '#/os/interface/hostEnvironment';
 import type { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
-import { ReadMediaFileTool, type VideoUploader } from '#/agent/media/tools/read-media';
+import { ReadMediaFileTool } from '#/agent/tools/read-media-file/readMediaFileTool';
+import type { VideoUploader } from '#/agent/tools/read-media-file/read-media-file';
 
 export interface RegisterMediaToolsDeps {
   readonly fs: IHostFileSystem;
@@ -32,6 +30,7 @@ export interface RegisterMediaToolsDeps {
   readonly capabilities: ModelCapability;
   readonly videoUploader?: VideoUploader;
   readonly telemetry?: ITelemetryService;
+  readonly inlineVideoSupported?: boolean;
 }
 
 export function registerMediaTools(
@@ -49,6 +48,7 @@ export function registerMediaTools(
       deps.capabilities,
       deps.videoUploader,
       deps.telemetry,
+      deps.inlineVideoSupported,
     ),
   );
 }
@@ -60,9 +60,9 @@ export function createVideoUploader(
   const uploadVideo = requester?.uploadVideo;
   if (uploadVideo === undefined) return undefined;
   const bound = uploadVideo.bind(requester);
-  if (telemetry === undefined) return (input) => bound(input);
+  if (telemetry === undefined) return (input, options) => bound(input, options);
 
-  return async (input) => {
+  return async (input, options) => {
     const startedAt = Date.now();
     const base = {
       ...telemetry.props,
@@ -76,7 +76,7 @@ export function createVideoUploader(
       }
     };
     try {
-      const part = await bound(input);
+      const part = await bound(input, options);
       track({ ...base, outcome: 'success', duration_ms: Date.now() - startedAt });
       return part;
     } catch (error) {

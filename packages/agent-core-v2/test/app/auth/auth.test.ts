@@ -32,8 +32,9 @@ import { IConfigService } from '#/app/config/config';
 import { ConfigRegistry } from '#/app/config/configService';
 import { type DomainEvent, IEventService } from '#/app/event/event';
 import { ILogService } from '#/_base/log/log';
-import { IHostRequestHeaders } from '#/kosong/model/hostRequestHeaders';
-import { MODELS_SECTION, type ModelRecord } from '#/kosong/model/model';
+import { IBootstrapService } from '#/app/bootstrap/bootstrap';
+import { IModelService, type ModelRecord } from '#/kosong/model/model';
+import { MODELS_SECTION } from '#/app/kosongConfig/configSection';
 import { IProviderService, type ProviderConfig, type ProvidersChangedEvent } from '#/kosong/provider/provider';
 
 // Side-effect registration: the OAuth-catalog verdict
@@ -77,6 +78,8 @@ interface FakeToolkit {
   readonly logout: ReturnType<typeof vi.fn>;
   readonly getCachedAccessToken: ReturnType<typeof vi.fn>;
   readonly tokenProvider: ReturnType<typeof vi.fn>;
+  readonly getManagedUsage: ReturnType<typeof vi.fn>;
+  readonly getManagedUserInfo: ReturnType<typeof vi.fn>;
 }
 
 describe('OAuthService', () => {
@@ -136,6 +139,14 @@ describe('OAuthService', () => {
         services = value as Record<string, unknown> | undefined;
         return;
       }
+      if (domain === 'defaultModel') {
+        defaultModel = value as string | undefined;
+        return;
+      }
+      if (domain === 'thinking') {
+        thinking = value as { enabled?: boolean; effort?: string } | undefined;
+        return;
+      }
       throw new Error(`unexpected config replace: ${domain}`);
     });
     events = [];
@@ -144,6 +155,8 @@ describe('OAuthService', () => {
       logout: vi.fn().mockResolvedValue({ providerName: OAUTH_PROVIDER, ok: true }),
       getCachedAccessToken: vi.fn().mockResolvedValue(undefined),
       tokenProvider: vi.fn().mockReturnValue({ getAccessToken: async () => 'access-token' }),
+      getManagedUsage: vi.fn().mockResolvedValue({ kind: 'error', message: 'not configured' }),
+      getManagedUserInfo: vi.fn().mockResolvedValue({ kind: 'error', message: 'not configured' }),
     };
     ix = createServices(disposables, {
       base: [registerBootstrapServices, registerTelemetryServices],
@@ -152,7 +165,7 @@ describe('OAuthService', () => {
           get: ((name: string) => providers[name]) as IProviderService['get'],
           list: (() => providers) as IProviderService['list'],
           set: providerSet as unknown as IProviderService['set'],
-          onDidChangeProviders: providerChangedEmitter.event,
+          onDidChangeProviders: providerChangedEmitter.event as IProviderService['onDidChangeProviders'],
         });
         reg.definePartialInstance(IConfigService, {
           get: ((domain: string) => configBacking()[domain]) as IConfigService['get'],
@@ -398,7 +411,7 @@ describe('OAuthService', () => {
       }),
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(configSet).toHaveBeenCalledWith('defaultModel', 'kimi-code/kimi-k2');
+    expect(configReplace).toHaveBeenCalledWith('defaultModel', 'kimi-code/kimi-k2');
   });
 
   it('startLogin returns authenticated when model refresh fails on the already-authenticated fast path', async () => {
@@ -421,7 +434,7 @@ describe('OAuthService', () => {
         oauth: EXAMPLE_COM_SCOPED_REF,
       }),
     );
-    expect(configSet).not.toHaveBeenCalledWith('defaultModel', expect.any(String));
+    expect(configReplace).not.toHaveBeenCalledWith('defaultModel', expect.any(String));
   });
 
   it('keeps a device-code login authenticated when model fetch is unavailable after authorization', async () => {
@@ -439,7 +452,7 @@ describe('OAuthService', () => {
     });
     await vi.waitFor(() => expect(svc.getFlow(OAUTH_PROVIDER)?.status).toBe('authenticated'));
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(configSet).not.toHaveBeenCalledWith('defaultModel', expect.any(String));
+    expect(configReplace).not.toHaveBeenCalledWith('defaultModel', expect.any(String));
   });
 
   it('refreshes managed models and sets the default model after a device-code login succeeds', async () => {
@@ -467,7 +480,7 @@ describe('OAuthService', () => {
         'kimi-code/kimi-k2': expect.objectContaining({ model: 'kimi-k2' }),
       }),
     );
-    expect(configSet).toHaveBeenCalledWith('defaultModel', 'kimi-code/kimi-k2');
+    expect(configReplace).toHaveBeenCalledWith('defaultModel', 'kimi-code/kimi-k2');
   });
 
   it('keeps an in-flight OAuth flow alive when unrelated providers change', async () => {
@@ -596,8 +609,8 @@ describe('OAuthService', () => {
         maxContextSize: 8192,
       },
     });
-    expect(configSet).toHaveBeenCalledWith('defaultModel', undefined);
-    expect(configSet).toHaveBeenCalledWith('thinking', undefined);
+    expect(configReplace).toHaveBeenCalledWith('defaultModel', undefined);
+    expect(configReplace).toHaveBeenCalledWith('thinking', undefined);
   });
 
   it('logout removes managed web services while preserving unrelated services', async () => {
@@ -670,6 +683,42 @@ describe('OAuthService', () => {
     expect(toolkit.tokenProvider).toHaveBeenCalledWith(OAUTH_PROVIDER, expectedRef);
   });
 
+  it('getManagedUsage resolves the managed runtime auth and delegates to the toolkit', async () => {
+    const usage = { kind: 'ok' as const, summary: null, limits: [], extraUsage: null };
+    toolkit.getManagedUsage.mockResolvedValue(usage);
+    const svc = createService();
+
+    await expect(svc.getManagedUsage(OAUTH_PROVIDER)).resolves.toBe(usage);
+    expect(toolkit.getManagedUsage).toHaveBeenCalledWith(OAUTH_PROVIDER, {
+      oauthRef: EXAMPLE_COM_SCOPED_REF,
+      baseUrl: 'https://api.example.com',
+    });
+  });
+
+  it('getManagedUserInfo resolves the managed runtime auth and delegates to the toolkit', async () => {
+    const userInfo = {
+      kind: 'ok' as const,
+      userInfo: {
+        userId: 'u_1',
+        nickname: 'moonwalker',
+        status: 'USER_STATUS_NORMAL',
+        region: 'REGION_CN',
+        userLevel: 30,
+        userLevelName: 'Vivace',
+        domain: 1,
+        domainName: 'DOMAIN_EXAMPLE',
+      },
+    };
+    toolkit.getManagedUserInfo.mockResolvedValue(userInfo);
+    const svc = createService();
+
+    await expect(svc.getManagedUserInfo(OAUTH_PROVIDER)).resolves.toBe(userInfo);
+    expect(toolkit.getManagedUserInfo).toHaveBeenCalledWith(OAUTH_PROVIDER, {
+      oauthRef: EXAMPLE_COM_SCOPED_REF,
+      baseUrl: 'https://api.example.com',
+    });
+  });
+
   it('refreshOAuthProviderModels returns an empty result when no Kimi Code provider is configured', async () => {
     providers = { [NON_OAUTH_PROVIDER]: { type: 'openai', apiKey: 'sk-test' } };
     const svc = createService();
@@ -721,8 +770,8 @@ describe('OAuthService', () => {
         'kimi-code/kimi-k2': expect.objectContaining({ model: 'kimi-k2' }),
       }),
     );
-    expect(configSet).toHaveBeenCalledWith('defaultModel', 'kimi-code/kimi-k2');
-    expect(configSet).toHaveBeenCalledWith('thinking', { enabled: true });
+    expect(configReplace).toHaveBeenCalledWith('defaultModel', 'kimi-code/kimi-k2');
+    expect(configReplace).toHaveBeenCalledWith('thinking', { enabled: true });
     expect(events).toEqual([
       {
         type: 'event.model_catalog.changed',
@@ -786,10 +835,12 @@ describe('WebSearchProviderService', () => {
           resolveTokenProvider:
             resolveTokenProvider as unknown as IOAuthService['resolveTokenProvider'],
         });
-        reg.definePartialInstance(IHostRequestHeaders, {
-          headers: {
-            'User-Agent': 'kimi-code-cli/test',
-            'X-Msh-Device-Id': 'device-test',
+        reg.definePartialInstance(IBootstrapService, {
+          args: {
+            requestHeaders: {
+              'User-Agent': 'kimi-code-cli/test',
+              'X-Msh-Device-Id': 'device-test',
+            },
           },
         });
         reg.definePartialInstance(IConfigService, {
@@ -1119,6 +1170,11 @@ describe('AuthSummaryService', () => {
           get: ((name: string) => providers[name]) as IProviderService['get'],
           list: (() => providers) as IProviderService['list'],
         });
+        reg.definePartialInstance(IModelService, {
+          get: ((id: string) => models[id]) as IModelService['get'],
+          list: (() => models) as IModelService['list'],
+          getDefaultModel: (() => defaultModel) as IModelService['getDefaultModel'],
+        });
         reg.definePartialInstance(IConfigService, {
           get: ((domain: string) => {
             if (domain === MODELS_SECTION) return models;
@@ -1255,6 +1311,10 @@ describe('AuthLegacyService', () => {
       additionalServices: (reg) => {
         reg.definePartialInstance(IProviderService, {
           list: (() => providers) as IProviderService['list'],
+        });
+        reg.definePartialInstance(IModelService, {
+          ready: Promise.resolve(),
+          getDefaultModel: (() => defaultModel) as IModelService['getDefaultModel'],
         });
         reg.definePartialInstance(IConfigService, {
           ready: Promise.resolve(),

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 import {
   ErrorCodes,
+  KimiError,
   makeErrorPayload,
   type AgentContextData,
   type ApprovalRequest,
@@ -59,6 +60,7 @@ import type {
   SkillSummary,
   PluginCommandDef,
   Unsubscribe,
+  WorkspaceTrustInfo,
 } from '#/types';
 
 const MAIN_AGENT_ID = 'main';
@@ -66,6 +68,12 @@ const MAIN_AGENT_ID = 'main';
 export interface SessionPromptRpcInput {
   readonly sessionId: string;
   readonly input: PromptInput;
+  /**
+   * Client-managed session tool denylist (full-replace semantics), forwarded
+   * to engines with profile tool gating. Omit to keep the persisted value;
+   * `[]` clears the client portion.
+   */
+  readonly disabledTools?: readonly string[];
 }
 
 export interface SessionIdRpcInput {
@@ -214,6 +222,20 @@ export abstract class SDKRpcClientBase {
     return rpc.listWorkspaceSkills({ workDir });
   }
 
+  /**
+   * Workspace-trust state for `workDir`. The v1 engine has no trust concept,
+   * so the base implementation reports an always-trusted workspace and the
+   * trust write is a no-op; only the v2 client overrides these.
+   */
+  async getWorkspaceTrustInfo(workDir: string): Promise<WorkspaceTrustInfo> {
+    void workDir;
+    return { trusted: true, gatedMcpServers: [] };
+  }
+
+  async trustWorkspace(workDir: string): Promise<void> {
+    void workDir;
+  }
+
   async renameSession(input: RenameSessionInput): Promise<void> {
     const rpc = await this.getRpc();
     return rpc.renameSession({
@@ -257,6 +279,29 @@ export abstract class SDKRpcClientBase {
   async removeProvider(providerId: string): Promise<KimiConfig> {
     const rpc = await this.getRpc();
     return rpc.removeKimiProvider({ providerId });
+  }
+
+  /**
+   * Whether this client can persist several config sections as ONE atomic
+   * write (see {@link replaceConfigSections}). v1 cannot — its config writes
+   * are whole-document merges — so the default is false.
+   */
+  supportsAtomicSectionReplace(): boolean {
+    return false;
+  }
+
+  /**
+   * Replace several top-level config sections in ONE atomic write: a section
+   * mapped to `undefined` is cleared, sections absent from the record are
+   * left untouched. Unlike {@link setConfig} (a deep-merge that cannot
+   * delete keys), this has replace semantics, so a staged removal can be
+   * expressed by the written record itself.
+   */
+  replaceConfigSections(_sections: Record<string, unknown>): Promise<void> {
+    throw new KimiError(
+      ErrorCodes.NOT_IMPLEMENTED,
+      'This SDK client does not support atomic config section replacement.',
+    );
   }
 
   async listGlobalMcpServers(): Promise<readonly McpServerConfig[]> {
@@ -317,6 +362,7 @@ export abstract class SDKRpcClientBase {
       sessionId: input.sessionId,
       agentId,
       input: input.input,
+      disabledTools: input.disabledTools,
     });
   }
 
@@ -422,6 +468,11 @@ export abstract class SDKRpcClientBase {
       agentId: this.interactiveAgentId,
       effort: input.effort,
     });
+  }
+
+  async applyPersistedSecondaryModel(input: SessionIdRpcInput): Promise<void> {
+    const rpc = await this.getRpc();
+    return rpc.applyPersistedSecondaryModel({ sessionId: input.sessionId });
   }
 
   async setPermission(input: SetSessionPermissionRpcInput): Promise<void> {
@@ -571,8 +622,12 @@ export abstract class SDKRpcClientBase {
       sessionId: input.sessionId,
       agentId,
     });
-    const maxContextTokens = config.modelCapabilities?.max_context_tokens ?? 0;
+    const capability = config.modelCapabilities;
+    const maxContextTokens = capability?.max_input_tokens ?? capability?.max_context_tokens ?? 0;
     const contextTokens = context.tokenCount;
+    // Deliberately unclamped: >100% is the documented overflow signal on this
+    // path (see acp-adapter's formatContextUsage), unlike the schema-bounded
+    // REST status surfaces which clamp to 1.
     const contextUsage = maxContextTokens > 0 ? contextTokens / maxContextTokens : 0;
     const hasUsage =
       usage.byModel !== undefined || usage.total !== undefined || usage.currentTurn !== undefined;

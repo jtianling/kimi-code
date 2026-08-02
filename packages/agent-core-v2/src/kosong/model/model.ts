@@ -1,9 +1,11 @@
 /**
- * `kosong/model` domain (L2) — model configuration registry contract.
+ * `kosong/model` domain — model configuration registry contract.
  *
- * Owns the `ModelRecord` config record (id → resolution recipe) and the
- * `models` config section; exposes CRUD and persists through `config`. App-
- * scoped — model configuration is global and shared across sessions.
+ * Owns the `ModelRecord` config record type (id → resolution recipe) and the
+ * in-memory model registry contract. App-scoped — model configuration is
+ * global and shared across sessions. Kosong has no persistence — it defines
+ * types only. Persisting mutations is the upper layer's job, not this
+ * domain's.
  *
  * Two configuration paths are supported:
  *   - **Structured**: `providerId` references an entry in `[providers.*]`.
@@ -25,72 +27,57 @@
  * `type`, never as a protocol).
  */
 
-import { z } from 'zod';
-
 import { createDecorator, type ServiceIdentifier } from '#/_base/di/instantiation';
-import type { Event } from '#/_base/event';
-import { ProtocolSchema } from '#/kosong/protocol/protocol';
+import type { Event, IWaitUntil } from '#/_base/event';
+import type { Protocol } from '#/kosong/protocol/protocol';
 
-import { OAuthRefSchema } from '../provider/provider';
+import type { OAuthRef } from '../provider/provider';
 
-export const MODELS_SECTION = 'models';
+export interface ModelOverride {
+  maxContextSize?: number;
+  maxInputSize?: number;
+  maxOutputSize?: number;
+  capabilities?: string[];
+  displayName?: string;
+  reasoningKey?: string;
+  adaptiveThinking?: boolean;
+  supportEfforts?: string[];
+  defaultEffort?: string;
+  offEffort?: string;
+}
 
-/**
- * The global default-model pointer: a single model id from `[models.*]` used
- * whenever a call site does not name a model explicitly. Cross-domain by
- * nature — written by `IModelCatalog.setDefaultModel` and the OAuth login /
- * refresh flows (`app/auth`), read by runtime resolution fallbacks. The sole
- * owner of the key constant lives here; every consumer imports it.
- */
-export const DEFAULT_MODEL_SECTION = 'defaultModel';
+export interface ModelRecord {
+  providerId?: string;
 
-const ModelBaseSchema = z.object({
-  providerId: z.string().optional(),
+  baseUrl?: string;
+  apiKey?: string;
+  oauth?: OAuthRef;
 
-  baseUrl: z.string().optional(),
-  apiKey: z.string().optional(),
-  oauth: OAuthRefSchema.optional(),
+  protocol?: Protocol;
 
-  protocol: ProtocolSchema.optional(),
+  name?: string;
+  aliases?: string[];
 
-  name: z.string().optional(),
-  aliases: z.array(z.string()).optional(),
+  provider?: string;
+  model?: string;
+  maxContextSize?: number;
+  maxInputSize?: number;
+  maxOutputSize?: number;
+  capabilities?: string[];
+  displayName?: string;
+  reasoningKey?: string;
+  adaptiveThinking?: boolean;
+  betaApi?: boolean;
+  supportEfforts?: string[];
+  defaultEffort?: string;
+  offEffort?: string;
 
-  provider: z.string().optional(),
-  model: z.string().optional(),
-  maxContextSize: z.number().int().min(1).optional(),
-  maxOutputSize: z.number().int().min(1).optional(),
-  capabilities: z.array(z.string()).optional(),
-  displayName: z.string().optional(),
-  reasoningKey: z.string().optional(),
-  adaptiveThinking: z.boolean().optional(),
-  betaApi: z.boolean().optional(),
-  supportEfforts: z.array(z.string()).optional(),
-  defaultEffort: z.string().optional(),
-});
+  overrides?: ModelOverride;
 
-export const ModelOverrideSchema = ModelBaseSchema.omit({
-  providerId: true,
-  baseUrl: true,
-  apiKey: true,
-  oauth: true,
-  protocol: true,
-  name: true,
-  aliases: true,
-  provider: true,
-  model: true,
-  betaApi: true,
-}).partial();
+  [key: string]: unknown;
+}
 
-export const ModelRecordSchema = ModelBaseSchema.extend({
-  overrides: ModelOverrideSchema.optional(),
-}).passthrough();
-
-export type ModelRecord = z.infer<typeof ModelRecordSchema>;
-
-export const ModelsSectionSchema = z.record(z.string(), ModelRecordSchema);
-
-export type ModelsSection = z.infer<typeof ModelsSectionSchema>;
+export type ModelsSection = Record<string, ModelRecord>;
 
 export interface ModelsChangedEvent {
   readonly added: readonly string[];
@@ -98,18 +85,25 @@ export interface ModelsChangedEvent {
   readonly changed: readonly string[];
 }
 
+export interface DefaultModelChangedEvent {
+  readonly id: string | undefined;
+}
+
 export interface IModelService {
   readonly _serviceBrand: undefined;
 
-  readonly onDidChangeModels: Event<ModelsChangedEvent>;
+  readonly ready: Promise<void>;
+  readonly onDidChangeModels: Event<ModelsChangedEvent & IWaitUntil>;
+  readonly onDidChangeDefaultModel: Event<DefaultModelChangedEvent & IWaitUntil>;
   get(id: string): ModelRecord | undefined;
   list(): Readonly<Record<string, ModelRecord>>;
+  getDefaultModel(): string | undefined;
   set(id: string, model: ModelRecord): Promise<void>;
   delete(id: string): Promise<void>;
+  loadAll(models: ModelsSection, defaultModel: string | undefined): void;
+  replaceAll(models: ModelsSection): Promise<void>;
+  setDefaultModel(id: string | undefined): Promise<void>;
 }
 
-// The decorator name matches the deleted legacy `app/model` contract
-// (`createDecorator` caches by name): keeping the legacy name preserves the
-// service identity every caller already resolves by.
 export const IModelService: ServiceIdentifier<IModelService> =
   createDecorator<IModelService>('modelService');

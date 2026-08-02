@@ -7,18 +7,21 @@ import {
   IAgentGoalService,
   IAgentLifecycleService,
   IAgentRPCService,
+  IAgentShellCommandService,
   IAppendLogStore,
   IEventService,
   IPluginService,
   ISessionIndex,
-  ISessionLifecycleService,
   ISessionMetadata,
-  IWorkspaceRegistry,
+  ISessionLifecycleService,
+  IWorkspaceService,
+  getLiveSessionById,
 } from '@moonshot-ai/agent-core-v2';
 import type { ServiceIdentifier } from '@moonshot-ai/agent-core-v2';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { type RunningServer, startServer } from '../src/start';
+import { TEST_HOST_IDENTITY } from './helpers/hostIdentity';
 import { authHeaders } from './helpers/auth';
 
 interface Envelope<T> {
@@ -58,12 +61,14 @@ interface GoalToolResultWire {
 // name — exactly how the typed client composes URLs, so the test never hardcodes
 // a channel name that could drift from the token.
 function rpc(
-  scope: 'core' | 'session' | 'agent',
+  scope: 'core' | 'workspace' | 'session' | 'agent',
   service: ServiceIdentifier<unknown>,
   method: string,
-  ids: { sid?: string; aid?: string } = {},
+  ids: { wid?: string; sid?: string; aid?: string } = {},
 ): string {
   if (scope === 'core') return `/api/v1/debug/${String(service)}/${method}`;
+  if (scope === 'workspace')
+    return `/api/v1/debug/workspace/${ids.wid}/${String(service)}/${method}`;
   if (scope === 'session') return `/api/v1/debug/session/${ids.sid}/${String(service)}/${method}`;
   return `/api/v1/debug/session/${ids.sid}/agent/${ids.aid}/${String(service)}/${method}`;
 }
@@ -75,7 +80,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'kimi-server-v2-rpc-'));
-    server = await startServer({ host: '127.0.0.1', port: 0, homeDir: home, logLevel: 'silent', debugEndpoints: true });
+    server = await startServer({ hostIdentity: TEST_HOST_IDENTITY, host: '127.0.0.1', port: 0, homeDir: home, logLevel: 'silent', debugEndpoints: true });
     base = `http://127.0.0.1:${server.port}`;
   });
 
@@ -130,13 +135,13 @@ describe('server-v2 /api/v1/debug RPC', () => {
   // The main agent scope is not created automatically on session creation
   // (server-v2 gap G10); create it here so the agent-scope dispatch resolves.
   async function createMainAgent(sessionId: string): Promise<void> {
-    const session = server!.core.accessor.get(ISessionLifecycleService).get(sessionId);
+    const session = getLiveSessionById(server!.core.accessor, sessionId);
     if (session === undefined) throw new Error(`session ${sessionId} not found`);
     await session.accessor.get(IAgentLifecycleService).create({ agentId: 'main' });
   }
 
   async function createSubagent(sessionId: string, agentId: string): Promise<void> {
-    const session = server!.core.accessor.get(ISessionLifecycleService).get(sessionId);
+    const session = getLiveSessionById(server!.core.accessor, sessionId);
     if (session === undefined) throw new Error(`session ${sessionId} not found`);
     await session.accessor.get(IAgentLifecycleService).create({ agentId });
   }
@@ -196,7 +201,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
     const cwd = home as string;
     const created = await call<{ id: string; root: string }>(
       'POST',
-      rpc('core', IWorkspaceRegistry, 'createOrTouch'),
+      rpc('core', IWorkspaceService, 'createOrTouch'),
       cwd,
     );
     expect(created.body.code).toBe(0);
@@ -204,7 +209,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
     const got = await call<{ id: string; root: string }>(
       'GET',
-      rpc('core', IWorkspaceRegistry, 'get'),
+      rpc('core', IWorkspaceService, 'get'),
       created.body.data.id,
     );
     expect(got.body.code).toBe(0);
@@ -215,7 +220,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
     const missing = join(home as string, 'never-created');
     const { body } = await call<null>(
       'POST',
-      rpc('core', IWorkspaceRegistry, 'createOrTouch'),
+      rpc('core', IWorkspaceService, 'createOrTouch'),
       missing,
     );
     expect(body.code).toBe(40409);
@@ -225,14 +230,14 @@ describe('server-v2 /api/v1/debug RPC', () => {
     const cwd = home as string;
     const created = await call<{ id: string; name: string }>(
       'POST',
-      rpc('core', IWorkspaceRegistry, 'createOrTouch'),
+      rpc('core', IWorkspaceService, 'createOrTouch'),
       cwd,
     );
     const id = created.body.data.id;
 
     const updated = await call<{ id: string; name: string }>(
       'POST',
-      rpc('core', IWorkspaceRegistry, 'update'),
+      rpc('core', IWorkspaceService, 'update'),
       [id, { name: 'renamed' }],
     );
     expect(updated.body.code).toBe(0);
@@ -240,7 +245,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
     const got = await call<{ id: string; name: string }>(
       'GET',
-      rpc('core', IWorkspaceRegistry, 'get'),
+      rpc('core', IWorkspaceService, 'get'),
       id,
     );
     expect(got.body.data.name).toBe('renamed');
@@ -248,7 +253,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
   it('counts active sessions', async () => {
     const cwd = home as string;
-    const created = await call<{ id: string }>('POST', rpc('core', IWorkspaceRegistry, 'createOrTouch'), cwd);
+    const created = await call<{ id: string }>('POST', rpc('core', IWorkspaceService, 'createOrTouch'), cwd);
     await createSession(cwd);
     const { body } = await call<number>(
       'POST',
@@ -288,8 +293,16 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
   it('archives a session', async () => {
     const id = await createSession(home as string);
-    const { body } = await call<null>('POST', rpc('session', ISessionLifecycleService, 'archive', { sid: id }), id);
+    const workspaceId = (await server!.core.accessor.get(ISessionIndex).get(id))!.workspaceId;
+    const { body } = await call<null>(
+      'POST',
+      rpc('workspace', ISessionLifecycleService, 'archive', { wid: workspaceId }),
+      id,
+    );
     expect(body.code).toBe(0);
+    // archive is a method on the handler's session lifecycle service; its
+    // single argument is the session id.
+    expect(body.data).toBeNull();
   });
 
   // --- Agent scope ----------------------------------------------------------
@@ -305,6 +318,28 @@ describe('server-v2 /api/v1/debug RPC', () => {
     );
     expect(body.code).toBe(0);
     expect(body.data.turn_id).toBe(0);
+  });
+
+  it('rejects disabledTools before bind without mutating prompt metadata', async () => {
+    const id = await createSession(home as string);
+    await createMainAgent(id);
+
+    const { body } = await call<null>(
+      'POST',
+      rpc('agent', IAgentRPCService, 'prompt', { sid: id, aid: 'main' }),
+      {
+        input: [{ type: 'text', text: 'must not become metadata' }],
+        disabledTools: ['Bash'],
+      },
+    );
+    expect(body.code).toBe(40001);
+
+    const metadata = await call<SessionMetaWire>(
+      'POST',
+      rpc('session', ISessionMetadata, 'read', { sid: id }),
+    );
+    expect(metadata.body.data.title).toBeUndefined();
+    expect(metadata.body.data.lastPrompt).toBeUndefined();
   });
 
   it('derives the session title and lastPrompt from the first prompt', async () => {
@@ -358,13 +393,13 @@ describe('server-v2 /api/v1/debug RPC', () => {
     expect(meta.body.data.lastPrompt).toBe('should not become the title');
   });
 
-  it('runs a shell command through the RPC facade', async () => {
+  it('runs a shell command through the shell command service', async () => {
     const id = await createSession(home as string);
     await createMainAgent(id);
 
     const { body } = await call<{ stdout: string; stderr: string; isError?: boolean }>(
       'POST',
-      rpc('agent', IAgentRPCService, 'runShellCommand', { sid: id, aid: 'main' }),
+      rpc('agent', IAgentShellCommandService, 'run', { sid: id, aid: 'main' }),
       { command: 'printf hello' },
     );
     expect(body.code).toBe(0);
@@ -600,6 +635,7 @@ describe('server-v2 /api/v1/debug RPC auth', () => {
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'kimi-server-v2-rpc-auth-'));
     server = await startServer({
+      hostIdentity: TEST_HOST_IDENTITY,
       host: '127.0.0.1',
       port: 0,
       homeDir: home,
@@ -667,6 +703,7 @@ describe('server-v2 /api/v1/debug RPC (dev-only, whitelist-free)', () => {
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'kimi-server-v2-debug-rpc-'));
     server = await startServer({
+      hostIdentity: TEST_HOST_IDENTITY,
       host: '127.0.0.1',
       port: 0,
       homeDir: home,

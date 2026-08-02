@@ -250,6 +250,41 @@ describe('AgentRecords persistence metadata', () => {
     await expect(records.replay()).rejects.toThrow('Missing wire migration for version 0.9');
   });
 
+  it('replays a tools.set_active_tools record without names without crashing', async () => {
+    const persistence = new InMemoryAgentRecordPersistence([
+      { type: 'metadata', protocol_version: AGENT_WIRE_PROTOCOL_VERSION, created_at: 1 },
+      // v2-engine wires may omit `names` (= every tool active); replaying
+      // such a record must not throw.
+      { type: 'tools.set_active_tools' } as unknown as AgentRecord,
+      { type: 'goal.create', goalId: 'g1', objective: 'do work' } as AgentRecord,
+    ]);
+    const { agent } = testAgent({ persistence });
+
+    await expect(agent.records.replay()).resolves.toEqual({ warning: undefined });
+    // Replay continued past the names-less record.
+    expect(agent.goal.getGoal().goal?.goalId).toBe('g1');
+  });
+
+  it('replays the deny list of a tools.set_active_tools record', async () => {
+    const persistence = new InMemoryAgentRecordPersistence([
+      { type: 'metadata', protocol_version: AGENT_WIRE_PROTOCOL_VERSION, created_at: 1 },
+      {
+        type: 'tools.set_active_tools',
+        names: ['Read', 'Write', 'Bash'],
+        disallowedNames: ['Write'],
+      } as AgentRecord,
+    ]);
+    const { agent } = testAgent({ persistence });
+    agent.config.update({ modelAlias: 'mock-model' });
+
+    await agent.records.replay();
+
+    const names = agent.tools.loopTools.map((tool) => tool.name);
+    expect(names).toContain('Read');
+    expect(names).toContain('Bash');
+    expect(names).not.toContain('Write');
+  });
+
   it('restores goal.* records during replay', async () => {
     const persistence = new InMemoryAgentRecordPersistence([
       { type: 'metadata', protocol_version: AGENT_WIRE_PROTOCOL_VERSION, created_at: 1 },

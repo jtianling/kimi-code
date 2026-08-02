@@ -1,5 +1,5 @@
 /**
- * `llmRequester` domain (L3) — `IAgentLLMRequesterService` implementation.
+ * `llmRequester` domain — `IAgentLLMRequesterService` implementation.
  *
  * Assembles per-turn `ModelRequestInput` from `profile` (system prompt),
  * `contextMemory` + `contextProjector` (history), `toolRegistry` (tools), and
@@ -8,8 +8,11 @@
  * params, then drives a bounded request chain through the `ModelRequester`
  * resolved from `IModelCatalog`: one primary `requester.request(input, signal,
  * params)` attempt plus projection rebuilds for request structure or media
- * compatibility; general retry policy remains in the loop's `stepRetry`
- * plugin. When a model is configured, `prepareTurnConfig` snapshots the
+ * compatibility. Before each request the projected messages pass through `media`'s
+ * video resolver, which rewrites every `kimi-file://` prompt-video reference
+ * to a provider-acceptable part (uploaded `ms://`, inline base64, or a
+ * `<video path>` tag) so the internal reference never reaches the wire. When a
+ * model is configured, `prepareTurnConfig` snapshots the
  * model, effective thinking effort, and system prompt at the turn boundary
  * so loop telemetry and every request in that turn share one configuration.
  * Forwards streamed `part` events to the caller's `onPart`
@@ -19,25 +22,27 @@
  * per-request fields) through `log`, publishes advisory model-capability
  * warnings through `eventBus`, records durable request-trace Ops
  * through `wire`, reports each request's `x-trace-id` to its caller, and
- * reports provider failures through `telemetry`. Bound at Agent scope.
+ * reports provider failures through `telemetry`. The mutable request state
+ * (`lastConfigLogSignature`, `turnConfigs`, `mediaDegradedTurns`,
+ * `mediaStrippedTurns`, `emittedThinkingEffortWarnings`) is registered into
+ * `agentState` (`IAgentStateService`) and read/written through it. Bound at
+ * Agent scope.
  */
 
 import { createHash } from 'node:crypto';
-import { InstantiationType } from '#/_base/di/extensions';
-import { LifecycleScope, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { defineState } from '#/_base/state/stateRegistry';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import {
   IAgentContextProjectorService,
   type MediaStripSnapshot,
 } from '#/agent/contextProjector/contextProjector';
 import { IAgentContextSizeService } from '#/agent/contextSize/contextSize';
-import {
-  IFaultInjectionService,
-  type FaultKind,
-} from '#/agent/faultInjection/faultInjection';
 import { IAgentProfileService, type ProfileModelContext } from '#/agent/profile/profile';
+import { IAgentStateService } from '#/agent/state/agentState';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import { IAgentToolSelectService } from '#/agent/toolSelect/toolSelect';
+import { IAgentVideoResolverService } from '#/agent/media/videoResolver';
 import { IAgentUsageService } from '#/agent/usage/usage';
 import { IConfigService } from '#/app/config/config';
 import { IEventBus } from '#/app/event/eventBus';
@@ -63,9 +68,10 @@ import {
   type ModelRequestTiming,
 } from '#/kosong/model/modelRequester';
 import type { ModelOverrides } from '#/kosong/model/model.types';
-import { MODELS_SECTION, type ModelsSection } from '#/kosong/model/model';
+import { IModelService } from '#/kosong/model/model';
 import { completionBudgetParams, resolveCompletionBudget } from '#/kosong/model/completionBudget';
-import { resolveThinkingKeep, THINKING_SECTION, type ThinkingConfig } from '#/kosong/model/thinking';
+import { resolveThinkingKeep, type ThinkingConfig } from '#/kosong/model/thinking';
+import { THINKING_SECTION } from '#/app/kosongConfig/configSection';
 import type { Protocol } from '#/kosong/protocol/protocol';
 import type { ApiErrorEvent } from '#/app/telemetry/events';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
@@ -134,14 +140,29 @@ interface TurnRequestConfig {
   readonly systemPrompt: string;
 }
 
+export const llmRequesterLastConfigLogSignatureKey = defineState<string | undefined>(
+  'llmRequester.lastConfigLogSignature',
+  () => undefined as string | undefined,
+);
+export const llmRequesterTurnConfigsKey = defineState<Map<number, TurnRequestConfig>>(
+  'llmRequester.turnConfigs',
+  () => new Map(),
+);
+export const llmRequesterMediaDegradedTurnsKey = defineState<Set<number>>(
+  'llmRequester.mediaDegradedTurns',
+  () => new Set(),
+);
+export const llmRequesterMediaStrippedTurnsKey = defineState<Map<number, MediaStripSnapshot>>(
+  'llmRequester.mediaStrippedTurns',
+  () => new Map(),
+);
+export const llmRequesterEmittedThinkingEffortWarningsKey = defineState<Set<string>>(
+  'llmRequester.emittedThinkingEffortWarnings',
+  () => new Set(),
+);
+
 export class AgentLLMRequesterService implements IAgentLLMRequesterService {
   declare readonly _serviceBrand: undefined;
-
-  private lastConfigLogSignature: string | undefined;
-  private readonly turnConfigs = new Map<number, TurnRequestConfig>();
-  private readonly mediaDegradedTurns = new Set<number>();
-  private readonly mediaStrippedTurns = new Map<number, MediaStripSnapshot>();
-  private readonly emittedThinkingEffortWarnings = new Set<string>();
 
   constructor(
     @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
@@ -149,16 +170,48 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     @IAgentContextSizeService private readonly contextSize: IAgentContextSizeService,
     @IAgentToolRegistryService private readonly tools: IAgentToolRegistryService,
     @IAgentToolSelectService private readonly toolSelect: IAgentToolSelectService,
+    @IAgentVideoResolverService private readonly videoResolver: IAgentVideoResolverService,
     @IAgentProfileService private readonly profile: IAgentProfileService,
     @IAgentUsageService private readonly usage: IAgentUsageService,
     @IConfigService private readonly config: IConfigService,
+    @IModelService private readonly modelService: IModelService,
     @IModelCatalog private readonly modelCatalog: IModelCatalog,
     @ILogService private readonly log: ILogService,
     @ITelemetryService private readonly telemetry: ITelemetryService,
     @IWireService private readonly wire: IWireService,
-    @IFaultInjectionService private readonly faultInjection: IFaultInjectionService,
     @IEventBus private readonly eventBus: IEventBus,
-  ) {}
+    @IAgentStateService private readonly states: IAgentStateService,
+  ) {
+    this.states.register(llmRequesterLastConfigLogSignatureKey);
+    this.states.register(llmRequesterTurnConfigsKey);
+    this.states.register(llmRequesterMediaDegradedTurnsKey);
+    this.states.register(llmRequesterMediaStrippedTurnsKey);
+    this.states.register(llmRequesterEmittedThinkingEffortWarningsKey);
+  }
+
+  private get lastConfigLogSignature(): string | undefined {
+    return this.states.get(llmRequesterLastConfigLogSignatureKey);
+  }
+
+  private set lastConfigLogSignature(value: string | undefined) {
+    this.states.set(llmRequesterLastConfigLogSignatureKey, value);
+  }
+
+  private get turnConfigs(): Map<number, TurnRequestConfig> {
+    return this.states.get(llmRequesterTurnConfigsKey);
+  }
+
+  private get mediaDegradedTurns(): Set<number> {
+    return this.states.get(llmRequesterMediaDegradedTurnsKey);
+  }
+
+  private get mediaStrippedTurns(): Map<number, MediaStripSnapshot> {
+    return this.states.get(llmRequesterMediaStrippedTurnsKey);
+  }
+
+  private get emittedThinkingEffortWarnings(): Set<string> {
+    return this.states.get(llmRequesterEmittedThinkingEffortWarningsKey);
+  }
 
   prepareTurnConfig(turnId: number): PreparedTurnRequestConfig | undefined {
     if (!this.profile.hasProvider()) return undefined;
@@ -245,10 +298,11 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
       protocol: model?.protocol,
       retryable: isRetryableGenerateError(error),
       duration_ms: Math.max(0, Date.now() - startedAt),
+      turn_id: source?.turnId,
+      request_kind: requestKindForTelemetry(source),
       trace_id: traceId,
     };
     if (source?.type === 'turn') {
-      properties['turn_id'] = source.turnId;
       if (source.step !== undefined) properties['step_no'] = source.step;
     }
     const statusCode = apiStatusCode(error);
@@ -298,7 +352,15 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
 
     const run = async (projection: RequestProjection): Promise<AgentLLMRequestFinish> => {
       onRequestTrace(undefined);
-      const input = requestInput(projection);
+      const projected = requestInput(projection);
+      const input = {
+        ...projected,
+        messages: await this.videoResolver.resolve(
+          projected.messages,
+          request.requester,
+          signal,
+        ),
+      };
       const fields =
         projection === 'normal'
           ? request.logFields
@@ -318,11 +380,6 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
       };
       this.logRequest(logInput);
       this.recordRequest(logInput);
-
-      const fault = this.faultInjection.take();
-      if (fault !== undefined) {
-        throw faultToError(fault);
-      }
 
       let message: Message | undefined;
       let usage = emptyUsage();
@@ -450,23 +507,17 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
   private warnAboutAnthropicThinkingEffort(request: ResolvedLLMRequest): void {
     if (request.model.protocol !== 'anthropic') return;
     const effort = request.thinkingEffort;
-    if (effort === 'on') return;
+    if (effort === 'on' || effort === 'off') return;
 
     let code: string;
     let message: string;
     let knownEfforts: string | undefined;
-    if (effort === 'off') {
-      if (!request.model.alwaysThinking) return;
-      code = 'anthropic-thinking-cannot-disable';
-      message = `Model "${request.model.name}" declares always-on thinking. The configured effort "off" will be sent unchanged to the Anthropic-compatible backend.`;
-    } else {
-      const supportEfforts = request.model.supportEfforts?.filter((value) => value.length > 0);
-      if (supportEfforts === undefined || supportEfforts.length === 0) return;
-      if (supportEfforts.includes(effort)) return;
-      code = 'anthropic-thinking-effort-not-listed';
-      knownEfforts = supportEfforts.join(',');
-      message = `Thinking effort "${effort}" is not listed for model "${request.model.name}" (known: ${supportEfforts.join(', ')}). The configured value will be sent unchanged to the Anthropic-compatible backend.`;
-    }
+    const supportEfforts = request.model.supportEfforts?.filter((value) => value.length > 0);
+    if (supportEfforts === undefined || supportEfforts.length === 0) return;
+    if (supportEfforts.includes(effort)) return;
+    code = 'anthropic-thinking-effort-not-listed';
+    knownEfforts = supportEfforts.join(',');
+    message = `Thinking effort "${effort}" is not listed for model "${request.model.name}" (known: ${supportEfforts.join(', ')}). The configured value will be sent unchanged to the Anthropic-compatible backend.`;
 
     const key = [code, request.modelAlias, request.model.name, effort, knownEfforts].join('\u0000');
     if (this.emittedThinkingEffortWarnings.has(key)) return;
@@ -611,9 +662,8 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     const systemPromptHash = fingerprint(input.systemPrompt);
     const overrides = this.config.get<ModelOverrides>('modelOverrides');
     const thinkingConfig = this.config.get<ThinkingConfig>(THINKING_SECTION);
-    const models = this.config.get<ModelsSection>(MODELS_SECTION);
     const modelConfig =
-      input.modelAlias === undefined ? undefined : models?.[input.modelAlias];
+      input.modelAlias === undefined ? undefined : this.modelService.get(input.modelAlias);
     const payload: PayloadOf<typeof llmRequest> = {
       kind: requestKindForRecord(fields),
       provider: input.protocol,
@@ -705,6 +755,12 @@ function logFieldsForSource(source: AgentLLMRequestSource | undefined): AgentLLM
   }
 }
 
+function requestKindForTelemetry(source: AgentLLMRequestSource | undefined): string | undefined {
+  if (source?.type === 'turn') return 'turn';
+  if (source?.type === 'operation') return source.requestKind ?? 'operation';
+  return undefined;
+}
+
 function providerVisibleTools(tools: readonly Tool[]): readonly Tool[] {
   if (!tools.some((tool) => tool.deferred === true)) return tools;
   return tools.filter((tool) => tool.deferred !== true);
@@ -737,12 +793,6 @@ function projectionField(
   return value === 'strict' || value === 'media-degraded' || value === 'media-stripped'
     ? value
     : undefined;
-}
-
-function faultToError(kind: FaultKind): Error {
-  return kind === 'request-too-large'
-    ? new APIRequestTooLargeError(413, 'Request Entity Too Large (fault injection)')
-    : new APIStatusError(400, 'unsupported image format: image/avif (fault injection)');
 }
 
 function fingerprint(content: string): string {
@@ -785,6 +835,6 @@ registerScopedService(
   LifecycleScope.Agent,
   IAgentLLMRequesterService,
   AgentLLMRequesterService,
-  InstantiationType.Eager,
+  ScopeActivation.OnScopeCreated,
   'llmRequester',
 );

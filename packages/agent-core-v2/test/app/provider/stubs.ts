@@ -1,5 +1,5 @@
 /**
- * `provider` domain (L2) — in-memory `IProviderService` test double.
+ * `provider` domain — in-memory `IProviderService` test double.
  *
  * Stores provider configuration by name for App-scope consumer tests.
  */
@@ -14,9 +14,14 @@ export function stubProviderService(
     _serviceBrand: undefined,
     ready,
     onDidChangeProviders: () => ({ dispose: () => {} }),
+    onDidChangeDefaultProvider: () => ({ dispose: () => {} }),
     get: (name: string) => providers[name],
     list: () => providers,
+    getDefaultProvider: () => undefined,
     set: async () => {},
     delete: async () => {},
+    loadAll: () => {},
+    replaceAll: async () => {},
+    setDefaultProvider: async () => {},
   };
 }

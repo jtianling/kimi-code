@@ -1,5 +1,5 @@
 /**
- * `kosong/model` domain (L2) — shared auth-material resolution.
+ * `kosong/model` domain — shared auth-material resolution.
  *
  * Resolves Model / Provider credential precedence for runtime model
  * resolution and auth-readiness probes. Pure computation, outside the
@@ -14,16 +14,20 @@
  *    managed models routed through protocol `anthropic` — keep only
  *    catalog-declared effort metadata. The verdict comes from the registry
  *    (`drivesThinkingThroughTraits`), not from a vendor string compare.
+ *    The unknown-name fallback within that inference only applies to names
+ *    that still carry a Claude marker (a `claude` substring or a bare family
+ *    word like `sonnet-latest`); clearly non-Claude names served over the
+ *    Anthropic protocol get no synthesized effort metadata.
  */
 
 import { Error2 } from '#/_base/errors/errors';
+import { CONFIG_INVALID_ERROR_CODE } from '#/kosong/contract/errors';
 import type { ResolutionTrace } from '#/kosong/contract/inspection';
 
-import { ConfigErrors } from '../../app/config/errors';
 import {
   BUDGET_THINKING_EFFORTS,
-  inferAnthropicModelProfile,
   matchKnownAnthropicModelProfile,
+  matchUnknownClaudeProfile,
 } from '../provider/bases/anthropic/anthropic-profile';
 import type { ProviderConfig } from '../provider/provider';
 import { explainProviderEndpoint } from '../provider/providerDefinition';
@@ -32,12 +36,6 @@ import type { ModelRecord } from './model';
 import type { ResolvedModelAuthMaterial } from './model.types';
 import { drivesThinkingThroughTraits } from './thinking';
 
-/**
- * The Model → Provider credential precedence chain. When `trace` is given,
- * the winning layer (and any env-bag hit, by env-var name) is recorded at
- * `resolved.auth`; without a trace the function is the pure chain it always
- * was.
- */
 export function resolveModelAuthMaterial(
   args: {
     readonly modelId: string;
@@ -115,7 +113,13 @@ export function effectiveModelConfig(
   ) {
     delete effective.defaultEffort;
   }
-  return withAnthropicProfile(effective, providerType);
+  const clamped =
+    effective.maxInputSize !== undefined &&
+    effective.maxContextSize !== undefined &&
+    effective.maxInputSize > effective.maxContextSize
+      ? { ...effective, maxInputSize: effective.maxContextSize }
+      : effective;
+  return withAnthropicProfile(clamped, providerType);
 }
 
 function withAnthropicProfile(model: ModelRecord, providerType?: string): ModelRecord {
@@ -125,7 +129,7 @@ function withAnthropicProfile(model: ModelRecord, providerType?: string): ModelR
     wireName === undefined
       ? undefined
       : providerType !== undefined && !drivesThinkingThroughTraits(providerType) && protocol === 'anthropic'
-        ? inferAnthropicModelProfile(wireName)
+        ? (matchKnownAnthropicModelProfile(wireName) ?? matchUnknownClaudeProfile(wireName))
         : matchKnownAnthropicModelProfile(wireName);
   if (profile === undefined) return model;
   const capability = profile.canDisableThinking ? 'thinking' : 'always_thinking';
@@ -161,7 +165,7 @@ export function nonEmpty(value: string | undefined): string | undefined {
 
 function authConflictError(kind: string, name: string): Error2 {
   return new Error2(
-    ConfigErrors.codes.CONFIG_INVALID,
+    CONFIG_INVALID_ERROR_CODE,
     `${kind} "${name}" has both apiKey and oauth set in config.toml - they are mutually exclusive. Remove one.`,
   );
 }

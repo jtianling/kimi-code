@@ -1,9 +1,10 @@
 /**
- * The wire `Message` shape — the legacy REST/streaming message format served
- * on the `messages`, `snapshot`, and `sessions` (`:undo`) edge surfaces.
- * Defined next to `messageProjection.ts`, which projects `ContextMessage`
- * into this shape; consumed by the `messageLegacy` edge adapter and the
- * transports.
+ * The wire `Message` shape — the legacy REST/streaming message format.
+ *
+ * Media sources come in three kinds: `url`, `base64`, and `file` (a daemon
+ * upload id). The `url` kind optionally pairs an `id` — the provider-issued
+ * file id behind a reference such as `ms://…` — forwarded on the wire when
+ * the provider keys media by id.
  */
 
 import { z } from 'zod';
@@ -36,7 +37,11 @@ export const toolResultContentSchema = z.object({
 export type ToolResultContent = z.infer<typeof toolResultContentSchema>;
 
 export const imageSourceSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('url'), url: z.string().min(1) }),
+  z.object({
+    kind: z.literal('url'),
+    url: z.string().min(1),
+    id: z.string().min(1).optional(),
+  }),
   z.object({
     kind: z.literal('base64'),
     media_type: z.string().min(1),
@@ -52,7 +57,6 @@ export const imageContentSchema = z.object({
 });
 export type ImageContent = z.infer<typeof imageContentSchema>;
 
-// Video uses the same source shape as image (url / base64 / uploaded file id).
 export const videoContentSchema = z.object({
   type: z.literal('video'),
   source: imageSourceSchema,

@@ -24,6 +24,8 @@ All flags are optional — run `kimi` directly to enter an interactive session:
 | `--auto` | | Start with auto permission mode; tool approvals are handled automatically and the Agent will not ask the user questions |
 | `--plan` | | Start a new session in Plan mode — the AI will prioritize read-only tools for exploration and planning |
 | `--skills-dir <dir>` | | Load Skills from the specified directory, replacing the automatically discovered user and project directories. Can be repeated |
+| `--agent <name>` | | Start a new session with the specified agent as the main Agent. Cannot be combined with `--session`/`--continue` |
+| `--agent-file <path>` | | Load a custom agent from a Markdown file for the new session and select it. Cannot be repeated or combined with `--agent`, `--session`, or `--continue` |
 | `--add-dir <dir>` | | Add an extra workspace directory for this session. Relative paths resolve against the current working directory. Can be repeated |
 
 `-r` / `--resume` is a hidden alias for `--session`; `--yes` and `--auto-approve` are hidden aliases for `--yolo` and are not shown in help output.
@@ -93,6 +95,17 @@ There are two ways to specify Skills directories, with different semantics:
   ```
 
 - **`extra_skill_dirs`** (`config.toml`): **Adds** directories on top of the automatically discovered ones, taking effect permanently. Suitable for configuring team-shared Skills. See [Agent Skills](../customization/skills.md).
+
+### Custom Agents
+
+`--agent` and `--agent-file` select which agent drives a new session, in both print mode (`kimi -p`) and the interactive TUI:
+
+```sh
+kimi --agent reviewer
+kimi -p --agent reviewer "Review the changes on this branch"
+```
+
+`--agent-file` registers a single agent file at the highest priority for this launch only and selects it; the flag cannot be repeated, and `--agent` and `--agent-file` are mutually exclusive. Both flags only apply when starting a new session — neither can be combined with `--session`/`--continue`, because the agent is bound at session creation and resuming restores the bound agent automatically. The selection is fixed at the session's first bind and cannot be switched later; in the TUI the flags bind only the startup session, and a session created later in the same process (for example via `/new`) starts with the default agent. See [Agents and Sub-Agents](../customization/agents.md#custom-agents) for the agent file format and discovery directories.
 
 ## Non-Interactive Execution
 
@@ -347,13 +360,14 @@ kimi provider catalog list anthropic
 
 #### `kimi provider catalog add <providerId>`
 
-Import a known provider directly from the catalog by ID. The protocol type, base URL, and model information are all supplied by the catalog — only an API key is required.
+Import a known provider directly from the catalog by ID. The protocol type, base URL, and model information are all supplied by the catalog — only an API key is required. Vendors whose protocol the catalog does not declare (e.g. xai, openrouter, and other vendor-specific SDKs) are imported as OpenAI-compatible and the output notes the guess; when the catalog provides no usable endpoint, `--base-url` is required. Proprietary protocols (e.g. Amazon Bedrock) cannot be imported.
 
 | Parameter / Option | Description |
 | --- | --- |
 | `<providerId>` | Provider ID in the catalog, e.g., `anthropic`, `openai` |
 | `--api-key <key>` | Provider API key. Falls back to `KIMI_REGISTRY_API_KEY` if not provided; required |
 | `--default-model <modelId>` | Optional — set `default_model` to `<providerId>/<modelId>` after import |
+| `--base-url <url>` | Override the catalog endpoint; required when the catalog declares none (or only an env placeholder) |
 | `--url <url>` | Override the catalog URL; defaults to `https://models.dev/api.json` |
 
 ```sh
@@ -366,3 +380,4 @@ kimi provider catalog add anthropic --api-key sk-ant-... --default-model claude-
 - [Slash Commands](./slash-commands.md) — Quick reference for control commands in the interactive TUI
 - [Configuration Files](../configuration/config-files.md) — Persistent configuration for `default_model`, permission mode, and other startup parameters
 - [Agent Skills](../customization/skills.md) — Skill file format for directories loaded via `--skills-dir`
+- [Agents and Sub-Agents](../customization/agents.md) — Built-in sub-agents, custom agent files, and main Agent selection via `--agent`

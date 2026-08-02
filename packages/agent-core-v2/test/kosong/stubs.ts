@@ -14,6 +14,7 @@ import {
   IConfigService,
   type ResolvedConfig,
 } from '#/app/config/config';
+import type { IModelOAuthTokens } from '#/kosong/model/modelOAuth';
 
 export class StubConfigService implements IConfigService {
   declare readonly _serviceBrand: undefined;
@@ -65,6 +66,19 @@ export class StubConfigService implements IConfigService {
       this._values.set(domain, value);
     }
     this._onDidChange.fire({ domain, source: 'set', value, previousValue });
+    return Promise.resolve();
+  }
+
+  replaceSections(sections: Readonly<Record<string, unknown>>): Promise<void> {
+    for (const [domain, value] of Object.entries(sections)) {
+      const previousValue = this._values.get(domain);
+      if (value === undefined) {
+        this._values.delete(domain);
+      } else {
+        this._values.set(domain, value);
+      }
+      this._onDidChange.fire({ domain, source: 'set', value, previousValue });
+    }
     return Promise.resolve();
   }
 
@@ -122,4 +136,25 @@ export function stubOAuthService(tokenProvider?: StubTokenProvider): IOAuthServi
     resolveTokenProvider: () => tokenProvider,
     getCachedAccessToken: () => Promise.resolve(undefined),
   } as unknown as IOAuthService;
+}
+
+/**
+ * The kosong-side OAuth port stub (`IModelOAuthTokens`), mirroring what the
+ * real `app/kosongConfig` adapter does over `IOAuthService`: a programmable
+ * token provider for `getAccessToken` and a probeable cached-token flag.
+ */
+export function stubModelOAuthTokens(
+  tokenProvider?: StubTokenProvider,
+  cachedToken?: string,
+): IModelOAuthTokens {
+  return {
+    _serviceBrand: undefined,
+    hasCachedAccessToken: () => Promise.resolve(cachedToken !== undefined),
+    getAccessToken: (_provider, _oauthRef, options) =>
+      tokenProvider === undefined
+        ? Promise.reject(new Error('auth.login_required'))
+        : tokenProvider.getAccessToken(
+            options?.force === true ? { force: true } : undefined,
+          ),
+  };
 }

@@ -1,9 +1,13 @@
 /**
- * `sessionLifecycleService` — creates and tracks sessions at the process
- * root. Mirrors `agent-core-v2/app/sessionLifecycle/sessionLifecycle.ts`.
- * The engine returns `ISessionScopeHandle`s; over JSON only the plain data
- * fields survive, so the wire keeps `{ id, kind }` (loose — extra fields may
- * appear in-process).
+ * `sessionLifecycleService` / `workspaceLifecycleService` — session
+ * lifecycle after the Workspace-domain split. The App-scope
+ * `workspaceLifecycleService` materializes one handler per workspace
+ * (`handlerFor`); the Workspace-scope `sessionLifecycleService` owns that
+ * workspace's sessions (create/resume/close/archive/restore/fork/
+ * createChild). Mirrors `agent-core-v2/app/workspaceLifecycle/*` and
+ * `agent-core-v2/workspace/sessionLifecycle/*`. The engine returns scope
+ * handles; over JSON only the plain data fields survive, so the wire keeps
+ * `{ id, kind }` (loose — extra fields may appear in-process).
  */
 
 import { z } from 'zod';
@@ -11,52 +15,10 @@ import { z } from 'zod';
 import { maybe, noResult } from '../helpers.js';
 import type { ServiceContract } from '../types.js';
 
-/**
- * Mirror of `mcpServerConfigSchema` in `../global/plugins.js` — kept local
- * because that fragment does not export its copy; keep the two in sync.
- * Mirrors `agent-core-v2/agent/mcp/config-schema.ts`.
- */
-const stringRecordSchema = z.record(z.string(), z.string());
-
-const mcpServerCommonFields = {
-  enabled: z.boolean().optional(),
-  startupTimeoutMs: z.number().int().min(1).optional(),
-  toolTimeoutMs: z.number().int().min(1).optional(),
-  enabledTools: z.array(z.string()).optional(),
-  disabledTools: z.array(z.string()).optional(),
-} as const;
-
-const mcpServerConfigSchema = z.discriminatedUnion('transport', [
-  z.object({
-    transport: z.literal('stdio'),
-    command: z.string().min(1),
-    args: z.array(z.string()).optional(),
-    env: stringRecordSchema.optional(),
-    cwd: z.string().optional(),
-    executor: z.enum(['local', 'kaos']).optional(),
-    ...mcpServerCommonFields,
-  }),
-  z.object({
-    transport: z.literal('http'),
-    url: z.string().url(),
-    headers: stringRecordSchema.optional(),
-    bearerTokenEnvVar: z.string().min(1).optional(),
-    ...mcpServerCommonFields,
-  }),
-  z.object({
-    transport: z.literal('sse'),
-    url: z.string().url(),
-    headers: stringRecordSchema.optional(),
-    bearerTokenEnvVar: z.string().min(1).optional(),
-    ...mcpServerCommonFields,
-  }),
-]);
-
 export const createSessionOptionsSchema = z.object({
   sessionId: z.string().optional(),
   workDir: z.string(),
   additionalDirs: z.array(z.string()).optional(),
-  mcpServers: z.record(z.string(), mcpServerConfigSchema).optional(),
 });
 
 export const forkSessionOptionsSchema = z.object({
@@ -69,11 +31,21 @@ export const forkSessionOptionsSchema = z.object({
 /** Same fields as `ForkSessionOptions` in the engine — keep in sync. */
 export const createChildSessionOptionsSchema = forkSessionOptionsSchema;
 
-/** `ISessionScopeHandle` as it survives JSON — `{ id, kind }` plus extras. */
+/** `IScopeHandle` as it survives JSON — `{ id, kind }` plus extras. */
 export const handleWireSchema = z.looseObject({
   id: z.string(),
   kind: z.number(),
 });
+
+/** `WorkspaceRef` — a `workspaceId` (optional `root` hint) or a bare `root`. */
+export const workspaceRefSchema = z.union([
+  z.object({ workspaceId: z.string(), root: z.string().optional() }),
+  z.object({ root: z.string() }),
+]);
+
+export const workspaceLifecycleContract = {
+  handlerFor: { input: z.tuple([workspaceRefSchema]), output: handleWireSchema },
+} satisfies ServiceContract;
 
 export const sessionLifecycleContract = {
   create: { input: z.tuple([createSessionOptionsSchema]), output: handleWireSchema },

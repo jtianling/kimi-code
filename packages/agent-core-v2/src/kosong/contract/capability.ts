@@ -1,5 +1,5 @@
 /**
- * `kosong/contract` domain (L0) — declared model capabilities.
+ * `kosong/contract` domain — declared model capabilities.
  *
  * `ModelCapability` describes the modalities and limits of a specific model
  * so callers can gate requests against what the model accepts without
@@ -17,6 +17,7 @@ export interface ModelCapability {
   readonly thinking: boolean;
   readonly tool_use: boolean;
   readonly max_context_tokens: number;
+  readonly max_input_tokens?: number;
   readonly dynamically_loaded_tools?: boolean;
 }
 

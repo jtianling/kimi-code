@@ -219,7 +219,8 @@ export class ContextMemory {
     const currentTokenCount = this.tokenCountWithPending;
     const importTokenCount = estimateTokensForMessages([message]);
     const totalTokenCount = currentTokenCount + importTokenCount;
-    const maxContextTokens = this.agent.config.modelCapabilities.max_context_tokens;
+    const capability = this.agent.config.modelCapabilities;
+    const maxContextTokens = capability.max_input_tokens ?? capability.max_context_tokens;
     if (maxContextTokens > 0 && totalTokenCount > maxContextTokens) {
       throw new KimiError(
         ErrorCodes.CONTEXT_OVERFLOW,
@@ -456,7 +457,9 @@ export class ContextMemory {
     // project() strips `origin`, the only anchor for the announcements.
     // setModel never rewrites history, so a mid-session switch
     // degrades/upgrades losslessly.
-    const shaped = this.agent.toolSelectEnabled ? messages : stripDynamicToolContext(messages);
+    const shaped = this.agent.toolSelectEnabled
+      ? this.agent.tools.shapeDynamicToolHistory(messages)
+      : stripDynamicToolContext(messages);
     const anomalies: ProjectionAnomaly[] = [];
     const result = project(this.agent.microCompaction.compact(shaped), {
       ...options,

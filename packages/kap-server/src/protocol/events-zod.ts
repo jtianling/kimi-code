@@ -540,6 +540,14 @@ export const sessionMetaUpdatedEventSchema = z.object({
   patch: z.record(z.string(), z.unknown()).optional(),
 });
 
+export const agentCreatedEventSchema = z.object({
+  type: z.literal('agent.created'),
+});
+
+export const agentDisposedEventSchema = z.object({
+  type: z.literal('agent.disposed'),
+});
+
 export const sessionCreatedEventSchema = z.object({
   type: z.literal('event.session.created'),
   session: sessionSchema,
@@ -638,6 +646,9 @@ export const turnEndedEventSchema = z.object({
   reason: turnEndReasonSchema,
   error: kimiErrorPayloadSchema.optional(),
   durationMs: z.number().optional(),
+  interruptReason: z
+    .enum(['user_cancelled', 'aborted', 'max_steps', 'error', 'filtered', 'blocked'])
+    .optional(),
 });
 
 export const turnStepStartedEventSchema = z.object({
@@ -904,6 +915,8 @@ export const agentEventSchema = z.discriminatedUnion('type', [
   errorEventSchema,
   warningEventSchema,
   agentStatusUpdatedEventSchema,
+  agentCreatedEventSchema,
+  agentDisposedEventSchema,
   sessionMetaUpdatedEventSchema,
   sessionCreatedEventSchema,
   workspaceCreatedEventSchema,

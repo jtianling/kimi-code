@@ -1,5 +1,5 @@
 /**
- * `kosong/provider` domain (L2) — Anthropic model capability profiles and name
+ * `kosong/provider` domain — Anthropic model capability profiles and name
  * matching. Matrix source: https://platform.claude.com/docs/en/build-with-claude/effort
  * and https://platform.claude.com/docs/en/build-with-claude/extended-thinking.
  */
@@ -143,3 +143,12 @@ export function matchKnownAnthropicModelProfile(model: string): AnthropicModelPr
 export function inferAnthropicModelProfile(model: string): AnthropicModelProfile {
   return matchKnownAnthropicModelProfile(model) ?? LATEST_OPUS_PROFILE;
 }
+
+export function matchUnknownClaudeProfile(model: string): AnthropicModelProfile | undefined {
+  const normalized = model.toLowerCase();
+  return normalized.includes('claude') || CLAUDE_FAMILY_WORD_RE.test(normalized)
+    ? LATEST_OPUS_PROFILE
+    : undefined;
+}
+
+const CLAUDE_FAMILY_WORD_RE = /\b(?:opus|sonnet|haiku|fable|mythos)\b/;

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { toDisposable } from '#/_base/di/lifecycle';
 import { type IAgentScopeHandle, type ISessionScopeHandle, LifecycleScope } from '#/_base/di/scope';
+import { TestInstantiationService } from '#/_base/di/test';
 import { IAgentBlobService } from '#/agent/blob/agentBlobService';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import type { ContextMessage } from '#/agent/contextMemory/types';
@@ -10,7 +11,8 @@ import type { ContentPart } from '#/kosong/contract/message';
 import { type IAppendLogStore } from '#/persistence/interface/appendLogStore';
 import { IWireService } from '#/wire/wire';
 import { ISessionIndex, type SessionSummary } from '#/app/sessionIndex/sessionIndex';
-import { ISessionLifecycleService } from '#/app/sessionLifecycle/sessionLifecycle';
+import { IWorkspaceLifecycleService } from '#/app/workspaceLifecycle/workspaceLifecycle';
+import { ISessionLifecycleService } from '#/workspace/sessionLifecycle/sessionLifecycle';
 import { IAgentLifecycleService } from '#/session/agentLifecycle/agentLifecycle';
 import { MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
 import { ISessionCronService } from '#/session/cron/sessionCronService';
@@ -72,10 +74,25 @@ function buildService(opts: {
     dispose: () => {},
   } as unknown as ISessionScopeHandle;
 
-  const lifecycle = {
-    resume: (sessionId: string) =>
-      Promise.resolve(sessionId === opts.summary.id ? sessionHandle : undefined),
-  } as unknown as ISessionLifecycleService;
+  const workspaceLifecycle = {
+    handlerFor: () =>
+      Promise.resolve({
+        id: opts.summary.workspaceId,
+        kind: LifecycleScope.Workspace,
+        accessor: {
+          get: (token: unknown): unknown => {
+            if (token === ISessionLifecycleService) {
+              return {
+                resume: (sessionId: string) =>
+                  Promise.resolve(sessionId === opts.summary.id ? sessionHandle : undefined),
+              };
+            }
+            throw new Error('unexpected workspace service access');
+          },
+        },
+        dispose: () => {},
+      }),
+  } as unknown as IWorkspaceLifecycleService;
 
   const index = {
     get: (sessionId: string) => Promise.resolve(sessionId === opts.summary.id ? opts.summary : undefined),
@@ -93,7 +110,10 @@ function buildService(opts: {
     acquire: () => toDisposable(() => {}),
   };
 
-  return new MessageLegacyService(lifecycle, index, appendLog);
+  const instantiation = new TestInstantiationService();
+  instantiation.stub(ISessionIndex, index);
+  instantiation.stub(IWorkspaceLifecycleService, workspaceLifecycle);
+  return new MessageLegacyService(instantiation, index, appendLog);
 }
 
 describe('MessageLegacyService', () => {
@@ -175,6 +195,54 @@ describe('MessageLegacyService', () => {
     expect(page.items[0]?.content[0]).toEqual({
       type: 'image',
       source: { kind: 'url', url: 'data:image/png;base64,AAAA' },
+    });
+  });
+
+  it('projects a kimi-file video reference to a structured file source without leaking the path', async () => {
+    const videoPart = {
+      type: 'video_url',
+      videoUrl: { url: 'kimi-file://file_9?path=%2Fcache%2Fclip.mp4' },
+    } as unknown as ContentPart;
+    const svc = buildService({
+      summary,
+      records: [
+        {
+          type: 'context.append_message',
+          message: { role: 'user', content: [videoPart], toolCalls: [] },
+        },
+      ],
+      contextMessages: [],
+    });
+
+    const page = await svc.list('s1', {});
+
+    expect(page.items[0]?.content[0]).toEqual({
+      type: 'video',
+      source: { kind: 'file', file_id: 'file_9' },
+    });
+  });
+
+  it('projects a provider video url to a structured url source carrying its id', async () => {
+    const videoPart = {
+      type: 'video_url',
+      videoUrl: { url: 'ms://prov-7', id: 'prov-7' },
+    } as unknown as ContentPart;
+    const svc = buildService({
+      summary,
+      records: [
+        {
+          type: 'context.append_message',
+          message: { role: 'user', content: [videoPart], toolCalls: [] },
+        },
+      ],
+      contextMessages: [],
+    });
+
+    const page = await svc.list('s1', {});
+
+    expect(page.items[0]?.content[0]).toEqual({
+      type: 'video',
+      source: { kind: 'url', url: 'ms://prov-7', id: 'prov-7' },
     });
   });
 

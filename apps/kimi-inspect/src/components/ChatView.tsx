@@ -19,21 +19,17 @@
  * derives from transcript state (`meta.activity` / running turns).
  */
 
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from 'react';
-
 import { IAgentRPCService } from '@moonshot-ai/agent-core-v2/agent/rpc/rpc';
+import { ISessionApprovalService } from '@moonshot-ai/agent-core-v2/session/approval/approval';
+import {
+  ISessionQuestionService,
+  type QuestionItem,
+  type QuestionRequest,
+} from '@moonshot-ai/agent-core-v2/session/question/question';
 import {
   EMPTY_AGENT_STATE,
   itemId,
   type AgentState,
-  type InteractionFrame,
   type NoticeFrame,
   type ToolCallFrame,
   type TranscriptAttachment,
@@ -49,24 +45,57 @@ import {
   type TurnOrigin,
   type TurnState,
 } from '@moonshot-ai/transcript';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 
+import { AuditTrail } from '../audit/trail';
 import { useConnection } from '../connection';
-import { fetchTranscriptPage, TRANSCRIPT_PAGE_SIZE } from '../transcript/api';
+import type { SearchHit } from '../search/api';
+import { fetchTranscriptOps, fetchTranscriptPage, TRANSCRIPT_PAGE_SIZE } from '../transcript/api';
 import {
   createCoalescedRunner,
+  hasTurnId,
   oldestTurnId,
   recoverLoadedWindow,
   TranscriptChatStore,
 } from '../transcript/store';
 import { TranscriptWs } from '../transcript/ws';
 import { ActionButton, Badge, ErrorLine, JsonView, relTime } from '../ui';
+import { ChatSearchBar } from './ChatSearchBar';
 
 const noopSubscribe = () => () => {};
+
+/** Active session id for deeply nested interaction views (approve/answer buttons). */
+const SessionContext = createContext<string>('');
+
+/**
+ * A navigation request into the chat timeline (e.g. from a search hit). The
+ * channel pages backwards until the turn enters the loaded window, then
+ * scrolls it into view and flashes it briefly.
+ */
+export interface ChatJump {
+  /** Turn to locate (`t<N>`); omitted = switch session/agent only, no scroll. */
+  readonly turnId?: string | undefined;
+  /** Step within the turn (`t<N>.<M>`); falls back to the turn card. */
+  readonly stepId?: string | undefined;
+  /** Changes on every request so re-clicking the same hit re-triggers. */
+  readonly nonce: number;
+}
 
 interface TranscriptChannel {
   /** Null until the effect has created the store (pre-ready / no session). */
   readonly store: TranscriptChatStore | null;
   readonly state: AgentState;
+  /** Records every step that built the store (audit panel data source). */
+  readonly trail: AuditTrail | null;
   /** True once the initial REST page load succeeded. */
   readonly loaded: boolean;
   /** Set when the initial/refresh load failed (e.g. server without transcript). */
@@ -85,64 +114,157 @@ function useTranscriptChannel(
 ): TranscriptChannel {
   const { baseUrl, config } = useConnection();
   const token = config.token.trim();
-  const [channel, setChannel] = useState<{ store: TranscriptChatStore } | null>(null);
+  const [channel, setChannel] = useState<{ store: TranscriptChatStore; trail: AuditTrail } | null>(
+    null,
+  );
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState<unknown>(null);
 
   useEffect(() => {
     if (!ready || sessionId === null) return;
     const store = new TranscriptChatStore();
+    const trail = new AuditTrail();
     const authToken = token === '' ? undefined : token;
     let disposed = false;
-    /** While a REST refresh is in flight, WS ops are buffered, then flushed. */
+    /** While a REST reload / catch-up is in flight, WS ops are buffered, then flushed. */
     let fetching = true;
     let buffer: TranscriptOperation[] = [];
+    /** Max batch seq seen while buffering (folded into the watermark on flush). */
+    let bufferedSeq: number | undefined;
+    /**
+     * Op-batch watermark: the store is known to include every batch with
+     * seq <= lastSeq. Sourced from REST page watermarks and applied batch
+     * seqs; `undefined` until a sequenced server provides one (legacy
+     * servers never do — every recovery then falls back to full refreshes).
+     */
+    let lastSeq: number | undefined;
+    /** Cursor of the in-flight recover fetch, paired with `onPageApplied`. */
+    let recoverBefore: string | undefined;
+    /** True once the initial page load succeeded (gates reset-driven catch-up). */
+    let seeded = false;
 
-    /** Full-state (re)load: newest page first, then backwards over `before_turn`. */
-    const refresh = createCoalescedRunner(async (): Promise<void> => {
-      fetching = true;
+    const noteSeq = (seq: number | undefined): void => {
+      if (seq === undefined) return;
+      lastSeq = lastSeq === undefined ? seq : Math.max(lastSeq, seq);
+    };
+
+    const flushBuffer = (): void => {
+      fetching = false;
+      if (buffer.length > 0) {
+        const flushed = buffer;
+        store.applyOps(flushed);
+        trail.recordOps(flushed, 'flushed', undefined, store.getState());
+        noteSeq(bufferedSeq);
+      }
       buffer = [];
+      bufferedSeq = undefined;
+    };
+
+    /** Page (re)load body shared by the full refresh and the catch-up fallback. */
+    const reloadPages = async (): Promise<void> => {
       // The window's oldest turn is the re-cover anchor: after a refresh the
       // server window may have shifted, and only re-loading up to THIS turn
       // preserves the previously loaded history.
       const prevOldest = oldestTurnId(store.getState().items);
       if (prevOldest !== undefined) captureAnchor();
+      const newest = await fetchTranscriptPage({
+        baseUrl,
+        token: authToken,
+        sessionId,
+        agentId,
+        pageSize: TRANSCRIPT_PAGE_SIZE,
+      });
+      if (disposed) return;
+      store.applyPage(newest, { replace: true });
+      trail.recordRest({ pageSize: TRANSCRIPT_PAGE_SIZE }, 'replace', newest, store.getState());
+      lastSeq = newest.seq;
+      // Re-cover the previously loaded window for refreshes (a no-op on the
+      // initial load, where there is no previous oldest turn).
+      await recoverLoadedWindow(
+        store,
+        prevOldest,
+        (beforeTurn) => {
+          recoverBefore = beforeTurn;
+          return fetchTranscriptPage({
+            baseUrl,
+            token: authToken,
+            sessionId,
+            agentId,
+            beforeTurn,
+            pageSize: TRANSCRIPT_PAGE_SIZE,
+          });
+        },
+        () => disposed,
+        (page) => {
+          trail.recordRest(
+            { beforeTurn: recoverBefore, pageSize: TRANSCRIPT_PAGE_SIZE },
+            'prepend',
+            page,
+            store.getState(),
+          );
+        },
+      );
+      if (!disposed) {
+        seeded = true;
+        setLoaded(true);
+        setLoadError(null);
+      }
+    };
+
+    /** Full-state (re)load: the legacy recovery path and the initial load. */
+    const refresh = createCoalescedRunner(async (): Promise<void> => {
+      fetching = true;
+      buffer = [];
+      bufferedSeq = undefined;
       try {
-        const newest = await fetchTranscriptPage({
+        await reloadPages();
+      } catch (error) {
+        if (!disposed) setLoadError(error);
+      } finally {
+        flushBuffer();
+      }
+    });
+
+    /**
+     * Targeted catch-up: fetch exactly the op batches after our watermark
+     * (`GET .../transcript/ops?since_seq=`). Falls back to a full page
+     * reload on a legacy server (no seq / endpoint missing), a journal that
+     * no longer covers the gap (`complete: false`), or a fetch failure.
+     */
+    const catchUp = createCoalescedRunner(async (): Promise<void> => {
+      if (lastSeq === undefined) {
+        refresh();
+        return;
+      }
+      fetching = true;
+      buffer = [];
+      bufferedSeq = undefined;
+      try {
+        const res = await fetchTranscriptOps({
           baseUrl,
           token: authToken,
           sessionId,
           agentId,
-          pageSize: TRANSCRIPT_PAGE_SIZE,
+          sinceSeq: lastSeq,
         });
         if (disposed) return;
-        store.applyPage(newest, { replace: true });
-        // Re-cover the previously loaded window for refreshes (a no-op on the
-        // initial load, where there is no previous oldest turn).
-        await recoverLoadedWindow(
-          store,
-          prevOldest,
-          (beforeTurn) =>
-            fetchTranscriptPage({
-              baseUrl,
-              token: authToken,
-              sessionId,
-              agentId,
-              beforeTurn,
-              pageSize: TRANSCRIPT_PAGE_SIZE,
-            }),
-          () => disposed,
-        );
-        if (!disposed) {
-          setLoaded(true);
-          setLoadError(null);
+        if (!res.complete) {
+          await reloadPages();
+        } else {
+          for (const batch of res.batches) {
+            store.applyOps(batch.ops);
+            trail.recordOps(batch.ops, 'catchup', undefined, store.getState());
+          }
+          noteSeq(res.latestSeq);
         }
-      } catch (error) {
-        if (!disposed) setLoadError(error);
+      } catch {
+        try {
+          await reloadPages();
+        } catch (error) {
+          if (!disposed) setLoadError(error);
+        }
       } finally {
-        fetching = false;
-        if (buffer.length > 0) store.applyOps(buffer);
-        buffer = [];
+        flushBuffer();
       }
     });
 
@@ -151,18 +273,53 @@ function useTranscriptChannel(
       token: authToken,
       sessionId,
       agentId,
+      getSince: () => lastSeq,
       handlers: {
-        onOps: (aid, ops) => {
+        onOps: (aid, ops, meta) => {
           if (aid !== agentId) return;
-          if (fetching) buffer.push(...ops);
-          else store.applyOps(ops);
+          if (fetching) {
+            buffer.push(...ops);
+            if (meta?.seq !== undefined) {
+              bufferedSeq = Math.max(bufferedSeq ?? 0, meta.seq);
+            }
+            trail.recordOps(ops, 'buffered', meta?.at, store.getState());
+            return;
+          }
+          // Seq gap: the store is behind by at least one batch. Catch up
+          // point-to-point instead of applying on a stale base (appends are
+          // offset-placed and would surface a gap anyway).
+          if (meta?.seq !== undefined && lastSeq !== undefined && meta.seq > lastSeq + 1) {
+            catchUp();
+            return;
+          }
+          store.applyOps(ops);
+          trail.recordOps(ops, 'live', meta?.at, store.getState());
+          noteSeq(meta?.seq);
         },
-        onResyncRequired: refresh,
-        onReconnected: refresh,
+        onReset: (_aid, snapshot, hasMoreOlder, meta) => {
+          trail.recordReset(snapshot, hasMoreOlder, meta?.at, store.getState());
+          // Sequenced mode only: a reset after seeding means the server could
+          // not replay from our `transcript_since` cursor (journal truncated)
+          // — catch up, which itself falls back to a full reload when the seq
+          // window is gone. On legacy servers (no watermark) resets are
+          // routine per-subscribe noise and stay ignored, as before.
+          if (seeded && lastSeq !== undefined) catchUp();
+        },
+        onResyncRequired: () => {
+          trail.recordEvent('resync', undefined, store.getState());
+          catchUp();
+        },
+        onReconnected: () => {
+          trail.recordEvent('ack-refresh', undefined, store.getState());
+          catchUp();
+        },
       },
     });
-    store.onGap = refresh;
-    setChannel({ store });
+    store.onGap = () => {
+      trail.recordEvent('gap', undefined, store.getState());
+      catchUp();
+    };
+    setChannel({ store, trail });
     setLoaded(false);
     setLoadError(null);
     refresh();
@@ -177,17 +334,29 @@ function useTranscriptChannel(
     channel?.store.subscribe ?? noopSubscribe,
     () => channel?.store.getState() ?? EMPTY_AGENT_STATE,
   );
-  return { store: channel?.store ?? null, state, loaded, loadError };
+  return { store: channel?.store ?? null, state, trail: channel?.trail ?? null, loaded, loadError };
 }
 
 export function ChatView({
   sessionId,
   agentId,
   ready,
+  onTrailChange,
+  jump,
+  onJumpHandled,
+  onOpenSearchHit,
 }: {
   sessionId: string | null;
   agentId: string;
   ready: boolean;
+  /** Hands the audit trail of the current channel up to the app shell (the audit panel lives in the right dock, not inside this view). */
+  onTrailChange?: (trail: AuditTrail | null) => void;
+  /** Pending navigation into the timeline (search result click). */
+  jump?: ChatJump | null | undefined;
+  /** Called once the jump has been processed (or found un-actionable). */
+  onJumpHandled?: (() => void) | undefined;
+  /** Hands an in-chat search hit up to the app shell (agent switch + jump). */
+  onOpenSearchHit?: ((hit: SearchHit) => void) | undefined;
 }) {
   const { klient, baseUrl, config } = useConnection();
   const [input, setInput] = useState('');
@@ -199,19 +368,103 @@ export function ChatView({
   const anchorRef = useRef<number | null>(null);
   /** Whether the viewport was pinned to the bottom before the last update. */
   const stickBottomRef = useRef(true);
+  /** The jump target being flashed (cleared on a timer). */
+  const [flash, setFlash] = useState<{ turnId: string; stepId?: string | undefined } | null>(null);
 
   const captureAnchor = useCallback(() => {
     const el = scrollRef.current;
     if (el !== null) anchorRef.current = el.scrollHeight - el.scrollTop;
   }, []);
 
-  const { store, state, loaded, loadError } = useTranscriptChannel(
+  const { store, state, trail, loaded, loadError } = useTranscriptChannel(
     sessionId,
     agentId,
     ready,
     captureAnchor,
   );
   const items = state.items;
+
+  // The audit panel is rendered by the app shell's right dock; report the
+  // trail (null while no channel exists) so it can subscribe to it there.
+  useEffect(() => {
+    onTrailChange?.(trail);
+  }, [onTrailChange, trail]);
+
+  // Jump navigation (search result click): once the channel has loaded, page
+  // backwards until the target turn enters the window, then scroll to the
+  // step (or the turn card) and flash it briefly. A turn that never appears
+  // (cut by an undo) degrades to no scroll.
+  useEffect(() => {
+    if (jump === null || jump === undefined || !loaded || store === null || sessionId === null) {
+      return;
+    }
+    if (jump.turnId === undefined) {
+      onJumpHandled?.();
+      return;
+    }
+    let cancelled = false;
+    const turnId = jump.turnId;
+    const stepId = jump.stepId;
+    void (async () => {
+      stickBottomRef.current = false;
+      const token = config.token.trim();
+      let recoverBefore: string | undefined;
+      await recoverLoadedWindow(
+        store,
+        turnId,
+        (beforeTurn) => {
+          recoverBefore = beforeTurn;
+          return fetchTranscriptPage({
+            baseUrl,
+            token: token === '' ? undefined : token,
+            sessionId,
+            agentId,
+            beforeTurn,
+            pageSize: TRANSCRIPT_PAGE_SIZE,
+          });
+        },
+        () => cancelled,
+        (page) => {
+          trail?.recordRest(
+            { beforeTurn: recoverBefore, pageSize: TRANSCRIPT_PAGE_SIZE },
+            'prepend',
+            page,
+            store.getState(),
+          );
+        },
+      );
+      if (cancelled) return;
+      if (!hasTurnId(store.getState().items, turnId)) {
+        onJumpHandled?.();
+        return;
+      }
+      setFlash({ turnId, stepId });
+      // The prepend renders asynchronously; wait two frames before scrolling.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (cancelled) return;
+          const root = scrollRef.current;
+          const stepEl =
+            stepId !== undefined
+              ? root?.querySelector(`[data-step-id="${CSS.escape(stepId)}"]`)
+              : undefined;
+          const target = stepEl ?? root?.querySelector(`[data-turn-id="${CSS.escape(turnId)}"]`);
+          target?.scrollIntoView({ block: 'start' });
+        });
+      });
+      onJumpHandled?.();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [jump, loaded, store, sessionId, agentId, baseUrl, config, trail, onJumpHandled]);
+
+  // The flash highlight clears itself after a short moment.
+  useEffect(() => {
+    if (flash === null) return;
+    const timer = setTimeout(() => setFlash(null), 2400);
+    return () => clearTimeout(timer);
+  }, [flash]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -248,6 +501,12 @@ export function ChatView({
         pageSize: TRANSCRIPT_PAGE_SIZE,
       });
       store.applyPage(page);
+      trail?.recordRest(
+        { beforeTurn: oldest, pageSize: TRANSCRIPT_PAGE_SIZE },
+        'prepend',
+        page,
+        store.getState(),
+      );
     } catch (error) {
       anchorRef.current = null;
       setOlderError(error);
@@ -256,15 +515,40 @@ export function ChatView({
     }
   };
 
+  // Auto-paging: the top sentinel auto-loads the previous REST page when it
+  // approaches the viewport (paused while a previous load failed — the retry
+  // button re-arms it). This replaces any manual "load earlier" action.
+  const loadOlderRef = useRef(loadOlder);
+  loadOlderRef.current = loadOlder;
+  const topSentinelRef = useRef<HTMLDivElement>(null);
+  const hasMoreOlder = state.hasMoreOlder;
+  useEffect(() => {
+    const sentinel = topSentinelRef.current;
+    const root = scrollRef.current;
+    if (sentinel === null || root === null || olderError !== null) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) void loadOlderRef.current();
+      },
+      { root, rootMargin: '400px 0px 0px 0px' },
+    );
+    observer.observe(sentinel);
+    return () => {
+      observer.disconnect();
+    };
+  }, [hasMoreOlder, loaded, olderError, loadingOlder]);
+
   const running =
     state.meta.activity === 'turn' ||
     items.some((item) => item.kind === 'turn' && item.state === 'running');
 
-  // Interactions render inline at their anchor tool frame; entities whose
-  // anchor frame is outside the loaded window collect here.
+  // Interactions render inline at their anchor tool frame; entities without
+  // an anchor (or whose anchor frame is outside the loaded window) collect
+  // here and render floating at the bottom.
   const anchoredToolCallIds = collectToolCallIds(items);
   const unanchoredInteractions = [...state.interactions.values()].filter(
-    (interaction) => !anchoredToolCallIds.has(interaction.toolCallId),
+    (interaction) =>
+      interaction.toolCallId === undefined || !anchoredToolCallIds.has(interaction.toolCallId),
   );
   const latestTodo = [...state.todos.values()].at(-1);
 
@@ -279,6 +563,7 @@ export function ChatView({
         .agent(agentId)
         .service(IAgentRPCService)
         .prompt({ input: [{ type: 'text', text }] });
+      trail?.recordEvent('prompt', text, state);
     } catch (error) {
       setSendError(error);
     }
@@ -288,6 +573,7 @@ export function ChatView({
     if (sessionId === null) return;
     try {
       await klient.session(sessionId).agent(agentId).service(IAgentRPCService).cancel({});
+      trail?.recordEvent('cancel', undefined, state);
     } catch (error) {
       setSendError(error);
     }
@@ -309,102 +595,137 @@ export function ChatView({
   }
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
-      <div className="flex items-center gap-2 border-b border-neutral-800 px-4 py-2">
-        <span className="font-mono text-[11px] text-neutral-400">{sessionId}</span>
-        <Badge tone="sky">agent: {agentId}</Badge>
-        {running ? <Badge tone="amber">turn running</Badge> : <Badge tone="green">idle</Badge>}
-        {state.pendingInteractions.size > 0 ? (
-          <Badge tone="amber">{state.pendingInteractions.size} pending</Badge>
-        ) : null}
-      </div>
+    <SessionContext.Provider value={sessionId}>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex items-center gap-2 border-b border-neutral-800 px-4 py-2">
+          <span className="font-mono text-[11px] text-neutral-400">{sessionId}</span>
+          <Badge tone="sky">agent: {agentId}</Badge>
+          {running ? <Badge tone="amber">turn running</Badge> : <Badge tone="green">idle</Badge>}
+          {state.pendingInteractions.size > 0 ? (
+            <Badge tone="amber">{state.pendingInteractions.size} pending</Badge>
+          ) : null}
+        </div>
 
-      <div className="flex-1 overflow-y-auto px-4 py-3" ref={scrollRef} onScroll={onScroll}>
-        {state.hasMoreOlder ? (
-          <div className="mb-3 flex justify-center">
-            <ActionButton onClick={() => void loadOlder()} disabled={loadingOlder}>
-              {loadingOlder ? 'Loading…' : 'Load earlier turns'}
-            </ActionButton>
-          </div>
-        ) : null}
-        {olderError !== null ? (
-          <div className="mb-2">
-            <ErrorLine error={olderError} />
-          </div>
-        ) : null}
-        {loadError !== null ? (
-          <div className="mb-2">
-            <ErrorLine error={loadError} />
-            <div className="mt-1 text-[11px] text-neutral-600">
-              Failed to load the transcript — the server may be too old to expose the transcript
-              API.
+        <ChatSearchBar sessionId={sessionId} onOpenHit={onOpenSearchHit} />
+
+        <div className="flex-1 overflow-y-auto px-4 py-3" ref={scrollRef} onScroll={onScroll}>
+          {state.hasMoreOlder ? (
+            <div ref={topSentinelRef} className="mb-3 flex justify-center">
+              <span className="text-[11px] text-neutral-600">
+                {loadingOlder ? 'Loading earlier turns…' : ''}
+              </span>
             </div>
-          </div>
-        ) : null}
-        {items.length === 0 && loadError === null ? (
-          <div className="text-[12px] text-neutral-600 italic">
-            {loaded ? 'Empty transcript — send a prompt below.' : 'Loading transcript…'}
-          </div>
-        ) : null}
-        {latestTodo !== undefined && latestTodo.items.length > 0 ? (
-          <div className="mb-3 rounded-lg border border-neutral-800 bg-neutral-900/40 px-3 py-2 text-[11px]">
-            <div className="mb-1 text-neutral-500">todo (latest)</div>
-            {latestTodo.items.map((entry, i) => (
-              <div key={i} className="flex gap-2">
-                <span className={entry.status === 'done' ? 'text-green-500' : entry.status === 'in_progress' ? 'text-sky-400' : 'text-neutral-600'}>
-                  {entry.status === 'done' ? '✔' : entry.status === 'in_progress' ? '◐' : '□'}
-                </span>
-                <span className={entry.status === 'done' ? 'text-neutral-600 line-through' : 'text-neutral-300'}>
-                  {entry.title}
-                </span>
+          ) : null}
+          {olderError !== null ? (
+            <div className="mb-2">
+              <ErrorLine error={olderError} />
+              <div className="mt-1 flex justify-center">
+                <ActionButton
+                  onClick={() => {
+                    setOlderError(null);
+                    void loadOlder();
+                  }}
+                >
+                  Retry loading earlier turns
+                </ActionButton>
               </div>
-            ))}
-          </div>
-        ) : null}
-        {items.map((item) => (
-          <ItemView
-            key={itemId(item)}
-            item={item}
-            tasks={state.tasks}
-            interactions={state.interactions}
-            attachments={state.attachments}
-          />
-        ))}
-        {unanchoredInteractions.map((interaction) => (
-          <InteractionEntityView key={interaction.interactionId} interaction={interaction} />
-        ))}
-      </div>
+            </div>
+          ) : null}
+          {loadError !== null ? (
+            <div className="mb-2">
+              <ErrorLine error={loadError} />
+              <div className="mt-1 text-[11px] text-neutral-600">
+                Failed to load the transcript — the server may be too old to expose the transcript
+                API.
+              </div>
+            </div>
+          ) : null}
+          {items.length === 0 && loadError === null ? (
+            <div className="text-[12px] text-neutral-600 italic">
+              {loaded ? 'Empty transcript — send a prompt below.' : 'Loading transcript…'}
+            </div>
+          ) : null}
+          {latestTodo !== undefined && latestTodo.items.length > 0 ? (
+            <div className="mb-3 rounded-lg border border-neutral-800 bg-neutral-900/40 px-3 py-2 text-[11px]">
+              <div className="mb-1 text-neutral-500">todo (latest)</div>
+              {latestTodo.items.map((entry, i) => (
+                <div key={i} className="flex gap-2">
+                  <span
+                    className={
+                      entry.status === 'done'
+                        ? 'text-green-500'
+                        : entry.status === 'in_progress'
+                          ? 'text-sky-400'
+                          : 'text-neutral-600'
+                    }
+                  >
+                    {entry.status === 'done' ? '✔' : entry.status === 'in_progress' ? '◐' : '□'}
+                  </span>
+                  <span
+                    className={
+                      entry.status === 'done' ? 'text-neutral-600 line-through' : 'text-neutral-300'
+                    }
+                  >
+                    {entry.title}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {items.map((item) => (
+            // Native virtual screen: the browser skips layout/paint for
+            // off-screen items and remembers their last rendered size
+            // (`auto` in contain-intrinsic-size), so long transcripts stay
+            // cheap without a windowing library.
+            <div
+              key={itemId(item)}
+              style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 200px' }}
+            >
+              <ItemView
+                item={item}
+                tasks={state.tasks}
+                interactions={state.interactions}
+                attachments={state.attachments}
+                flash={flash}
+              />
+            </div>
+          ))}
+          {unanchoredInteractions.map((interaction) => (
+            <InteractionEntityView key={interaction.interactionId} interaction={interaction} />
+          ))}
+        </div>
 
-      <div className="border-t border-neutral-800 p-3">
-        {sendError !== null ? (
-          <div className="mb-2">
-            <ErrorLine error={sendError} />
-          </div>
-        ) : null}
-        <div className="flex gap-2">
-          <textarea
-            className="min-h-[40px] flex-1 resize-y rounded border border-neutral-700 bg-neutral-950 px-3 py-2 text-[13px] text-neutral-100 outline-none focus:border-sky-600"
-            placeholder="Send a prompt to the active agent… (Enter to send, Shift+Enter for newline)"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                void send();
-              }
-            }}
-          />
-          <div className="flex flex-col gap-2">
-            <ActionButton onClick={() => void send()} disabled={running || input.trim() === ''}>
-              Send
-            </ActionButton>
-            <ActionButton onClick={() => void cancel()} danger disabled={!running}>
-              Cancel
-            </ActionButton>
+        <div className="border-t border-neutral-800 p-3">
+          {sendError !== null ? (
+            <div className="mb-2">
+              <ErrorLine error={sendError} />
+            </div>
+          ) : null}
+          <div className="flex gap-2">
+            <textarea
+              className="min-h-[40px] flex-1 resize-y rounded border border-neutral-700 bg-neutral-950 px-3 py-2 text-[13px] text-neutral-100 outline-none focus:border-sky-600"
+              placeholder="Send a prompt to the active agent… (Enter to send, Shift+Enter for newline)"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  void send();
+                }
+              }}
+            />
+            <div className="flex flex-col gap-2">
+              <ActionButton onClick={() => void send()} disabled={running || input.trim() === ''}>
+                Send
+              </ActionButton>
+              <ActionButton onClick={() => void cancel()} danger disabled={!running}>
+                Cancel
+              </ActionButton>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+    </SessionContext.Provider>
   );
 }
 
@@ -415,15 +736,26 @@ function ItemView({
   tasks,
   interactions,
   attachments,
+  flash,
 }: {
   item: TranscriptItem;
   tasks: ReadonlyMap<string, TranscriptTask>;
   interactions: ReadonlyMap<string, TranscriptInteraction>;
   attachments: ReadonlyMap<string, TranscriptAttachment>;
+  /** The jump target being flashed, if any. */
+  flash?: { turnId: string; stepId?: string | undefined } | null | undefined;
 }) {
   switch (item.kind) {
     case 'turn':
-      return <TurnView turn={item} tasks={tasks} interactions={interactions} attachments={attachments} />;
+      return (
+        <TurnView
+          turn={item}
+          tasks={tasks}
+          interactions={interactions}
+          attachments={attachments}
+          flash={flash}
+        />
+      );
     case 'marker':
       return <MarkerView marker={item} />;
     case 'taskref':
@@ -471,20 +803,31 @@ function TurnView({
   tasks,
   interactions,
   attachments,
+  flash,
 }: {
   turn: TranscriptTurn;
   tasks: ReadonlyMap<string, TranscriptTask>;
   interactions: ReadonlyMap<string, TranscriptInteraction>;
   attachments: ReadonlyMap<string, TranscriptAttachment>;
+  /** The jump target being flashed, if any. */
+  flash?: { turnId: string; stepId?: string | undefined } | null | undefined;
 }) {
+  const turnFlashed = flash?.turnId === turn.turnId && flash.stepId === undefined;
   return (
-    <div className="mb-3 rounded-lg border border-neutral-800 bg-neutral-900/30">
+    <div
+      data-turn-id={turn.turnId}
+      className={`mb-3 rounded-lg border bg-neutral-900/30 ${
+        turnFlashed ? 'border-sky-600' : 'border-neutral-800'
+      }`}
+    >
       <div className="flex items-center gap-2 border-b border-neutral-800/60 px-3 py-1.5">
         <span className="font-mono text-[10px] text-neutral-500">{turn.turnId}</span>
         <Badge tone={turn.origin.kind === 'user' ? 'sky' : 'neutral'}>{turn.origin.kind}</Badge>
         <Badge tone={turnStateTone(turn.state)}>{turn.state}</Badge>
         {turn.startedAt !== undefined ? (
-          <span className="text-[10px] text-neutral-600">{relTime(Date.parse(turn.startedAt))}</span>
+          <span className="text-[10px] text-neutral-600">
+            {relTime(Date.parse(turn.startedAt))}
+          </span>
         ) : null}
         {turn.usage !== undefined ? (
           <span className="ml-auto text-[10px] text-neutral-600">{usageText(turn.usage)}</span>
@@ -498,7 +841,11 @@ function TurnView({
           <AttachmentChips ids={turn.attachmentIds} attachments={attachments} />
         ) : null}
         {turn.steps.map((step) => (
-          <div key={step.stepId}>
+          <div
+            key={step.stepId}
+            data-step-id={step.stepId}
+            className={flash?.stepId === step.stepId ? 'rounded bg-sky-900/20' : undefined}
+          >
             {step.frames.map((frame) => (
               <FrameView
                 key={frame.frameId}
@@ -557,7 +904,8 @@ function TaskRefView({
   task: TranscriptTask | undefined;
 }) {
   const failed =
-    task !== undefined && (task.state === 'failed' || task.state === 'timed_out' || task.state === 'lost');
+    task !== undefined &&
+    (task.state === 'failed' || task.state === 'timed_out' || task.state === 'lost');
   return (
     <div className="mb-3 rounded-lg border border-neutral-800 bg-neutral-900/40 px-3 py-2 text-[11px]">
       <div className="flex items-center gap-2">
@@ -595,15 +943,21 @@ function AttachmentChips({
       {ids.map((id) => {
         const attachment = attachments.get(id);
         const label = attachment?.name ?? attachment?.mediaType ?? id;
-        const href =
-          attachment?.source?.kind === 'url' ? attachment.source.url : undefined;
+        const href = attachment?.source?.kind === 'url' ? attachment.source.url : undefined;
         return (
           <span
             key={id}
             className="rounded border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-[10px] text-neutral-400"
             title={attachment?.mediaType}
           >
-            📎 {href !== undefined ? <a href={href} className="underline">{label}</a> : label}
+            📎{' '}
+            {href !== undefined ? (
+              <a href={href} className="underline">
+                {label}
+              </a>
+            ) : (
+              label
+            )}
           </span>
         );
       })}
@@ -665,11 +1019,6 @@ function FrameView({
       );
     case 'tool':
       return <ToolFrameView frame={frame} tasks={tasks} interactions={interactions} />;
-    case 'interaction':
-      // 实体通道优先：同一 interactionId 的实体存在时，旧式内联帧是双写的
-      // 镜像，跳过以免重复渲染；只有旧服务端（无实体）才用帧兜底。
-      if (interactions.has(frame.interactionId)) return null;
-      return <InteractionFrameView frame={frame} />;
     case 'notice':
       return <NoticeFrameView frame={frame} />;
   }
@@ -694,10 +1043,13 @@ function ToolFrameView({
   return (
     <div className="mb-2 max-w-[85%] rounded-lg border border-neutral-800 bg-neutral-900/50 px-3 py-2 font-mono text-[11px]">
       <div className="mb-1 flex flex-wrap items-center gap-2">
-        <Badge tone={frame.state === 'error' ? 'red' : frame.state === 'running' ? 'amber' : 'neutral'}>
+        <Badge
+          tone={frame.state === 'error' ? 'red' : frame.state === 'running' ? 'amber' : 'neutral'}
+        >
           tool
         </Badge>
         <span className="text-neutral-300">{frame.name}</span>
+        <span className="text-neutral-600 select-all">{frame.toolCallId}</span>
         {frame.view !== undefined && frame.view !== frame.name ? (
           <span className="text-neutral-600">view: {frame.view}</span>
         ) : null}
@@ -707,11 +1059,15 @@ function ToolFrameView({
           </Badge>
         ))}
         {task !== undefined ? <span className="text-neutral-600">task: {task.state}</span> : null}
-        {frame.todoId !== undefined ? <span className="text-neutral-600">todo: {frame.todoId}</span> : null}
+        {frame.todoId !== undefined ? (
+          <span className="text-neutral-600">todo: {frame.todoId}</span>
+        ) : null}
       </div>
       {frame.input !== undefined ? (
         typeof frame.input === 'string' ? (
-          <pre className="max-h-32 overflow-auto whitespace-pre-wrap text-neutral-500">{frame.input}</pre>
+          <pre className="max-h-32 overflow-auto whitespace-pre-wrap text-neutral-500">
+            {frame.input}
+          </pre>
         ) : (
           <JsonView data={frame.input} />
         )
@@ -750,6 +1106,81 @@ function InteractionEntityView({
   interaction: TranscriptInteraction;
   nested?: boolean;
 }) {
+  const { klient } = useConnection();
+  const sessionId = useContext(SessionContext);
+  const [busy, setBusy] = useState(false);
+  const [respondError, setRespondError] = useState<unknown>(null);
+  /** Question answers in progress: question text → selected option labels. */
+  const [selections, setSelections] = useState<Readonly<Record<string, readonly string[]>>>({});
+  /** Question free-text ("Other") input: question text → draft. */
+  const [others, setOthers] = useState<Readonly<Record<string, string>>>({});
+
+  const pending = interaction.state === 'pending';
+  const questionRequest =
+    interaction.interactionKind === 'question'
+      ? (interaction.request as QuestionRequest | undefined)
+      : undefined;
+
+  const run = (fn: () => Promise<unknown>): void => {
+    setBusy(true);
+    setRespondError(null);
+    void fn()
+      .catch((error: unknown) => {
+        setRespondError(error);
+      })
+      .finally(() => {
+        setBusy(false);
+      });
+  };
+
+  const decide = (decision: 'approved' | 'rejected'): void => {
+    run(() =>
+      klient
+        .session(sessionId)
+        .service(ISessionApprovalService)
+        .decide(interaction.interactionId, { decision }),
+    );
+  };
+
+  const toggleOption = (question: QuestionItem, label: string): void => {
+    setSelections((prev) => {
+      const current = prev[question.question] ?? [];
+      const next =
+        question.multiSelect === true
+          ? current.includes(label)
+            ? current.filter((item) => item !== label)
+            : [...current, label]
+          : current.includes(label)
+            ? []
+            : [label];
+      return { ...prev, [question.question]: next };
+    });
+  };
+
+  const submitAnswers = (): void => {
+    const answers: Record<string, string> = {};
+    for (const question of questionRequest?.questions ?? []) {
+      const parts = [...(selections[question.question] ?? [])];
+      const other = (others[question.question] ?? '').trim();
+      if (other !== '') parts.push(other);
+      if (parts.length > 0) answers[question.question] = parts.join(', ');
+    }
+    // Mirror the TUI adapter: no answers at all resolves with null.
+    const result = Object.keys(answers).length > 0 ? { answers, method: 'enter' as const } : null;
+    run(() =>
+      klient
+        .session(sessionId)
+        .service(ISessionQuestionService)
+        .answer(interaction.interactionId, result),
+    );
+  };
+
+  const dismiss = (): void => {
+    run(() =>
+      klient.session(sessionId).service(ISessionQuestionService).dismiss(interaction.interactionId),
+    );
+  };
+
   return (
     <div
       className={`mb-2 max-w-[85%] rounded-lg border border-amber-900/50 bg-amber-950/20 px-3 py-2 text-[11px] ${
@@ -757,28 +1188,73 @@ function InteractionEntityView({
       }`}
     >
       <div className="mb-1 flex items-center gap-2">
-        <Badge tone={interaction.state === 'pending' ? 'amber' : 'neutral'}>
-          {interaction.interactionKind}
-        </Badge>
+        <Badge tone={pending ? 'amber' : 'neutral'}>{interaction.interactionKind}</Badge>
         <span className="text-neutral-400">{interaction.state}</span>
         <span className="text-neutral-600">tool: {interaction.toolCallId}</span>
       </div>
       {interaction.request !== undefined ? <JsonView data={interaction.request} /> : null}
       {interaction.response !== undefined ? <JsonView data={interaction.response} /> : null}
-    </div>
-  );
-}
-
-function InteractionFrameView({ frame }: { frame: InteractionFrame }) {
-  return (
-    <div className="mb-2 max-w-[85%] rounded-lg border border-amber-900/50 bg-amber-950/20 px-3 py-2 text-[11px]">
-      <div className="mb-1 flex items-center gap-2">
-        <Badge tone={frame.state === 'pending' ? 'amber' : 'neutral'}>{frame.interactionKind}</Badge>
-        <span className="text-neutral-400">{frame.state}</span>
-        <span className="text-neutral-600">legacy frame</span>
-      </div>
-      {frame.request !== undefined ? <JsonView data={frame.request} /> : null}
-      {frame.response !== undefined ? <JsonView data={frame.response} /> : null}
+      {pending && interaction.interactionKind === 'approval' ? (
+        <div className="mt-2 flex gap-2">
+          <ActionButton onClick={() => decide('approved')} disabled={busy}>
+            Approve
+          </ActionButton>
+          <ActionButton onClick={() => decide('rejected')} danger disabled={busy}>
+            Reject
+          </ActionButton>
+        </div>
+      ) : null}
+      {pending && questionRequest !== undefined ? (
+        <div className="mt-2">
+          {questionRequest.questions.map((question) => (
+            <div key={question.question} className="mb-2">
+              <div className="text-neutral-300">{question.header ?? question.question}</div>
+              <div className="mt-1 flex flex-wrap gap-1">
+                {question.options.map((option) => {
+                  const selected = (selections[question.question] ?? []).includes(option.label);
+                  return (
+                    <button
+                      key={option.label}
+                      className={`rounded border px-2 py-0.5 text-[10px] transition-colors disabled:opacity-40 ${
+                        selected
+                          ? 'border-sky-600 bg-sky-900/50 text-sky-200'
+                          : 'border-neutral-700 text-neutral-400 hover:bg-neutral-800'
+                      }`}
+                      title={option.description}
+                      disabled={busy}
+                      onClick={() => toggleOption(question, option.label)}
+                    >
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <input
+                className="mt-1 w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-[11px] text-neutral-100 outline-none focus:border-sky-600"
+                placeholder={question.otherLabel ?? 'Other…'}
+                value={others[question.question] ?? ''}
+                disabled={busy}
+                onChange={(e) => {
+                  setOthers((prev) => ({ ...prev, [question.question]: e.target.value }));
+                }}
+              />
+            </div>
+          ))}
+          <div className="flex gap-2">
+            <ActionButton onClick={submitAnswers} disabled={busy}>
+              Answer
+            </ActionButton>
+            <ActionButton onClick={dismiss} danger disabled={busy}>
+              Dismiss
+            </ActionButton>
+          </div>
+        </div>
+      ) : null}
+      {respondError !== null ? (
+        <div className="mt-2">
+          <ErrorLine error={respondError} />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -792,7 +1268,9 @@ function NoticeFrameView({ frame }: { frame: NoticeFrame }) {
         : 'bg-neutral-900/60 text-neutral-400';
   return (
     <div className={`mb-2 max-w-[85%] rounded px-3 py-1.5 text-[11px] ${tone}`}>
-      {frame.source !== undefined ? <span className="text-neutral-500">[{frame.source}] </span> : null}
+      {frame.source !== undefined ? (
+        <span className="text-neutral-500">[{frame.source}] </span>
+      ) : null}
       {frame.message}
       {frame.detail !== undefined ? <JsonView data={frame.detail} /> : null}
     </div>

@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => {
     loadTuiConfig: vi.fn(),
     detectTerminalTheme: vi.fn(),
     kimiHarnessConstructor: vi.fn(),
+    kimiHarnessV2Constructor: vi.fn(),
     harnessEnsureConfigFile: vi.fn(),
     harnessGetConfig: vi.fn(async () => ({
       providers: {},
@@ -67,6 +68,21 @@ const mocks = vi.hoisted(() => {
 
 vi.mock('@moonshot-ai/kimi-code-sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@moonshot-ai/kimi-code-sdk')>();
+  const makeHarnessStub = (args: unknown[]) => {
+    const options = args[0] as { readonly homeDir?: string } | undefined;
+    const homeDir = options?.homeDir ?? '/tmp/kimi-code-test-home';
+    return {
+      homeDir,
+      auth: {
+        getCachedAccessToken: mocks.harnessGetCachedAccessToken,
+      },
+      ensureConfigFile: mocks.harnessEnsureConfigFile,
+      getConfig: mocks.harnessGetConfig,
+      getConfigDiagnostics: mocks.harnessGetConfigDiagnostics,
+      close: mocks.harnessClose,
+      track: mocks.harnessTrack,
+    };
+  };
   return {
     ...actual,
     resolveKimiHome: mocks.resolveKimiHome,
@@ -78,17 +94,11 @@ vi.mock('@moonshot-ai/kimi-code-sdk', async (importOriginal) => {
         mocks.createKimiDeviceId(homeDir);
       }
       mocks.kimiHarnessConstructor(...args);
-      return {
-        homeDir,
-        auth: {
-          getCachedAccessToken: mocks.harnessGetCachedAccessToken,
-        },
-        ensureConfigFile: mocks.harnessEnsureConfigFile,
-        getConfig: mocks.harnessGetConfig,
-        getConfigDiagnostics: mocks.harnessGetConfigDiagnostics,
-        close: mocks.harnessClose,
-        track: mocks.harnessTrack,
-      };
+      return makeHarnessStub(args);
+    },
+    createKimiHarnessV2: (...args: unknown[]) => {
+      mocks.kimiHarnessV2Constructor(...args);
+      return makeHarnessStub(args);
     },
   };
 });
@@ -163,6 +173,70 @@ describe('runShell', () => {
     mocks.harnessCreatesDeviceIdOnConstruction = false;
   });
 
+  const minimalCliOptions = {
+    session: undefined,
+    continue: false,
+    yolo: false,
+    auto: false,
+    plan: false,
+    model: undefined,
+    outputFormat: undefined,
+    prompt: undefined,
+    skillsDirs: [],
+    agent: undefined,
+    agentFiles: [],
+  };
+
+  function stubTuiStartup(): void {
+    mocks.loadTuiConfig.mockResolvedValue({
+      theme: 'dark',
+      editorCommand: null,
+      notifications: { enabled: true, condition: 'unfocused' },
+    });
+    mocks.tuiStart.mockResolvedValue(undefined);
+  }
+
+  function withEnv(patch: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
+    const saved: Record<string, string | undefined> = {};
+    for (const key of Object.keys(patch)) {
+      saved[key] = process.env[key];
+      const value = patch[key];
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    return fn().finally(() => {
+      for (const key of Object.keys(patch)) {
+        const value = saved[key];
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    });
+  }
+
+  it('builds the v2 harness when the master experimental flag is set', async () => {
+    stubTuiStartup();
+    await withEnv({ KIMI_CODE_EXPERIMENTAL_FLAG: '1' }, async () => {
+      await runShell(minimalCliOptions, '1.2.3-test');
+    });
+    expect(mocks.kimiHarnessV2Constructor).toHaveBeenCalledTimes(1);
+    expect(mocks.kimiHarnessConstructor).not.toHaveBeenCalled();
+  });
+
+  it('keeps the v1 harness when the master experimental flag is unset', async () => {
+    stubTuiStartup();
+    await withEnv({ KIMI_CODE_EXPERIMENTAL_FLAG: undefined }, async () => {
+      await runShell(minimalCliOptions, '1.2.3-test');
+    });
+    expect(mocks.kimiHarnessConstructor).toHaveBeenCalledTimes(1);
+    expect(mocks.kimiHarnessV2Constructor).not.toHaveBeenCalled();
+  });
+
   it('constructs KimiHarness and KimiTUI with startup input', async () => {
     mocks.loadTuiConfig.mockResolvedValue({
       theme: 'dark',
@@ -183,6 +257,8 @@ describe('runShell', () => {
       outputFormat: undefined,
       prompt: undefined,
       skillsDirs: [],
+      agent: undefined,
+      agentFiles: [],
       addDirs: ['../shared', '/tmp/extra'],
     };
 
@@ -191,7 +267,7 @@ describe('runShell', () => {
     expect(mocks.kimiHarnessConstructor).toHaveBeenCalledWith(
       expect.objectContaining({
         identity: expect.objectContaining({
-          userAgentProduct: 'kimi-code-cli',
+          productName: 'kimi-code-cli',
           version: '1.2.3-test',
         }),
         sessionStartedProperties: { yolo: true, auto: false, plan: true, afk: false },
@@ -243,6 +319,35 @@ describe('runShell', () => {
     });
   });
 
+  it('resolves the --agent profile into the TUI startup input', async () => {
+    mocks.loadTuiConfig.mockResolvedValue({
+      theme: 'dark',
+      editorCommand: null,
+      notifications: { enabled: true, condition: 'unfocused' },
+    });
+    mocks.tuiStart.mockResolvedValue(undefined);
+
+    await runShell(
+      {
+        session: undefined,
+        continue: false,
+        yolo: false,
+        auto: false,
+        plan: false,
+        model: undefined,
+        outputFormat: undefined,
+        prompt: undefined,
+        skillsDirs: [],
+        agent: 'reviewer',
+        agentFiles: [],
+      },
+      '1.2.3-test',
+    );
+
+    const [, , startupInput] = mocks.kimiTuiConstructor.mock.calls[0]!;
+    expect(startupInput).toMatchObject({ agentProfile: 'reviewer' });
+  });
+
   it('forwards skillsDirs from CLI options to the harness', async () => {
     mocks.loadTuiConfig.mockResolvedValue({
       theme: 'dark',
@@ -262,6 +367,8 @@ describe('runShell', () => {
         outputFormat: undefined,
         prompt: undefined,
         skillsDirs: ['/skills'],
+        agent: undefined,
+        agentFiles: [],
       },
       '1.2.3-test',
     );
@@ -295,6 +402,8 @@ describe('runShell', () => {
         outputFormat: undefined,
         prompt: undefined,
         skillsDirs: [],
+        agent: undefined,
+        agentFiles: [],
       },
       '1.2.3-test',
     );
@@ -335,6 +444,8 @@ describe('runShell', () => {
         outputFormat: undefined,
         prompt: undefined,
         skillsDirs: [],
+        agent: undefined,
+        agentFiles: [],
       },
       '1.2.3-test',
     );
@@ -378,6 +489,8 @@ describe('runShell', () => {
         outputFormat: undefined,
         prompt: undefined,
         skillsDirs: [],
+        agent: undefined,
+        agentFiles: [],
       },
       '1.2.3-test',
     );
@@ -411,6 +524,8 @@ describe('runShell', () => {
         outputFormat: undefined,
         prompt: undefined,
         skillsDirs: [],
+        agent: undefined,
+        agentFiles: [],
       },
       '1.2.3-test',
     );
@@ -462,6 +577,8 @@ describe('runShell', () => {
         outputFormat: undefined,
         prompt: undefined,
         skillsDirs: [],
+        agent: undefined,
+        agentFiles: [],
       },
       '1.2.3-test',
     );
@@ -500,6 +617,8 @@ describe('runShell', () => {
         outputFormat: undefined,
         prompt: undefined,
         skillsDirs: [],
+        agent: undefined,
+        agentFiles: [],
       },
       '1.2.3-test',
     );
@@ -534,6 +653,8 @@ describe('runShell', () => {
           outputFormat: undefined,
           prompt: undefined,
           skillsDirs: [],
+          agent: undefined,
+          agentFiles: [],
         },
         '1.2.3-test',
       );
@@ -583,6 +704,8 @@ describe('runShell', () => {
           outputFormat: undefined,
           prompt: undefined,
           skillsDirs: [],
+          agent: undefined,
+          agentFiles: [],
         },
         '1.2.3-test',
       );
@@ -625,6 +748,8 @@ describe('runShell', () => {
           outputFormat: undefined,
           prompt: undefined,
           skillsDirs: [],
+          agent: undefined,
+          agentFiles: [],
         },
         '1.2.3-test',
       ),
@@ -662,6 +787,8 @@ describe('runShell', () => {
           outputFormat: undefined,
           prompt: undefined,
           skillsDirs: [],
+          agent: undefined,
+          agentFiles: [],
         },
         '1.2.3-test',
       );
@@ -716,6 +843,8 @@ describe('runShell', () => {
           outputFormat: undefined,
           prompt: undefined,
           skillsDirs: [],
+          agent: undefined,
+          agentFiles: [],
         },
         '1.2.3-test',
       );
@@ -762,6 +891,8 @@ describe('runShell', () => {
           outputFormat: undefined,
           prompt: undefined,
           skillsDirs: [],
+          agent: undefined,
+          agentFiles: [],
         },
         '1.2.3-test',
         { migrateOnly: true },
