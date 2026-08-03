@@ -194,6 +194,13 @@ export const activateSkillPayloadSchema = z.object({
   args: z.string().optional(),
 });
 
+/** Same shape as `ActivatePluginCommandPayload` in the engine. */
+export const activatePluginCommandPayloadSchema = z.object({
+  pluginId: z.string(),
+  commandName: z.string(),
+  args: z.string().optional(),
+});
+
 export const undoHistoryPayloadSchema = z.object({
   count: z.number(),
 });
@@ -221,5 +228,9 @@ export const agentRpcContract = {
   undoHistory: { input: z.tuple([undoHistoryPayloadSchema]), output: z.number() },
   cancelCompaction: { input: z.tuple([emptyPayloadSchema]), output: noResult },
   activateSkill: { input: z.tuple([activateSkillPayloadSchema]), output: noResult },
+  activatePluginCommand: {
+    input: z.tuple([activatePluginCommandPayloadSchema]),
+    output: noResult,
+  },
   getTools: { input: z.tuple([emptyPayloadSchema]), output: z.array(toolInfoSchema) },
 } satisfies ServiceContract;

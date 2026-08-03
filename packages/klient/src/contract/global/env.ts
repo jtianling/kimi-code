@@ -35,4 +35,11 @@ export const envContract = {
   storeDir: stringRead,
   cacheDir: stringRead,
   logsDir: stringRead,
+  /** Persistence-scope resolver (`scope('sessions')` etc.) — a method, not a property. */
+  scope: {
+    input: z.tuple([
+      z.enum(['config', 'sessions', 'blobs', 'store', 'logs', 'cache', 'credentials', 'cron']),
+    ]),
+    output: z.string(),
+  },
 } satisfies ServiceContract;

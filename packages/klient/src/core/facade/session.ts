@@ -14,6 +14,7 @@ import type { AgentActivityState } from '@moonshot-ai/agent-core-v2/agent/activi
 import type { IAgentMcpService } from '@moonshot-ai/agent-core-v2/agent/mcp/mcp';
 import { SECONDARY_MODEL_SECTION } from '@moonshot-ai/agent-core-v2/app/kosongConfig/configSection';
 import type { SessionWarning } from '@moonshot-ai/agent-core-v2/app/sessionLegacy/sessionProtocol';
+import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 import type { ISessionCronService } from '@moonshot-ai/agent-core-v2/session/cron/sessionCronService';
 import type { SecondaryModelWarning } from '@moonshot-ai/agent-core-v2/session/subagent/secondaryModelWarning';
 import type { IWorkspaceDirs } from '@moonshot-ai/agent-core-v2/workspace/workspaceDirs/workspaceDirs';
@@ -106,7 +107,19 @@ export interface SessionFacade {
   archive(): Promise<void>;
   /** Re-materialize a closed session; `false` when it no longer exists. */
   restore(): Promise<boolean>;
-  fork(input?: { title?: string; metadata?: Record<string, unknown> }): Promise<SessionMeta>;
+  /**
+   * Materialize a session (live → existing handle, closed → cold resume);
+   * `false` when it no longer exists. Unlike `restore`, the archived flag is
+   * left untouched (mirrors the v1 SDK `resumeSession`).
+   */
+  resume(options?: { additionalDirs?: readonly string[] }): Promise<boolean>;
+  /** Whether the session is currently materialized (live) under its workspace handler. */
+  isLive(): Promise<boolean>;
+  fork(input?: {
+    newSessionId?: string;
+    title?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<SessionMeta>;
   createChild(input?: {
     title?: string;
     metadata?: Record<string, unknown>;
@@ -149,6 +162,28 @@ export interface SessionFacade {
    * is persisted or its recipe is unknown.
    */
   applyPersistedSecondaryModel(): Promise<void>;
+  /** Re-run the secondary-model warning check against the live config. */
+  recheckSecondaryModelWarning(): Promise<void>;
+  /** Merged skill view of the session (builtin + user + project + plugin). */
+  listSkills(): Promise<readonly SkillSummary[]>;
+  /** The session's path layout and workspace view (live sessions only). */
+  context(): Promise<{
+    cwd: string;
+    sessionDir: string;
+    additionalDirs: readonly string[];
+  }>;
+  /** Run the `/init` AGENTS.md generator (session scope; main agent must exist). */
+  generateAgentsMd(): Promise<void>;
+  /** Materialize (create-or-get, cold-restoring the persisted wire) an agent. */
+  materializeAgent(agentId: string): Promise<void>;
+  /** Ids of the session's live agents. */
+  listLiveAgents(): Promise<readonly string[]>;
+  /**
+   * Reconnect one MCP server of the session's workspace handler (mirrors the
+   * v1 SDK `Session.reconnectMcpServer`). Raises the engine's
+   * `mcp.server_not_found` / `mcp.server_disabled` for a bad name.
+   */
+  reconnectMcpServer(name: string): Promise<void>;
   readonly approvals: SessionApprovalsFacade;
   readonly questions: SessionQuestionsFacade;
   readonly interactions: SessionInteractionsFacade;
@@ -170,14 +205,19 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
   };
   const spawn = async (
     method: 'fork' | 'createChild',
-    input: { title?: string; metadata?: Record<string, unknown> } = {},
+    input: { newSessionId?: string; title?: string; metadata?: Record<string, unknown> } = {},
   ): Promise<SessionMeta> => {
     const workspaceId = await resolveWorkspaceId();
     if (workspaceId === undefined) {
       throw new RPCError(NOT_FOUND, `session not found: ${sessionId}`);
     }
     const handle = (await call({ workspaceId }, 'sessionLifecycleService', method, [
-      { sourceSessionId: sessionId, title: input.title, metadata: input.metadata },
+      {
+        sourceSessionId: sessionId,
+        newSessionId: input.newSessionId,
+        title: input.title,
+        metadata: input.metadata,
+      },
     ])) as HandleWire;
     return call({ sessionId: handle.id }, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
   };
@@ -228,8 +268,27 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
       if (workspaceId === undefined) return false;
       const handle = (await call({ workspaceId }, 'sessionLifecycleService', 'restore', [
         sessionId,
-      ])) as HandleWire | null;
-      return handle !== null;
+      ])) as HandleWire | null | undefined;
+      return handle !== null && handle !== undefined;
+    },
+    resume: async (options) => {
+      const workspaceId = await resolveWorkspaceId();
+      if (workspaceId === undefined) return false;
+      const handle = (await call({ workspaceId }, 'sessionLifecycleService', 'resume', [
+        sessionId,
+        options?.additionalDirs === undefined
+          ? undefined
+          : { additionalDirs: options.additionalDirs },
+      ])) as HandleWire | null | undefined;
+      return handle !== null && handle !== undefined;
+    },
+    isLive: async () => {
+      const workspaceId = await resolveWorkspaceId();
+      if (workspaceId === undefined) return false;
+      const handle = (await call({ workspaceId }, 'sessionLifecycleService', 'get', [
+        sessionId,
+      ])) as HandleWire | null | undefined;
+      return handle !== null && handle !== undefined;
     },
     fork: (input) => spawn('fork', input),
     createChild: (input) => spawn('createChild', input),
@@ -238,8 +297,10 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
       // `fork('main')` throws on a missing source, and `create` (unlike
       // `resume`) does not eagerly materialize the main agent — force
       // materialization through a main-agent-scope call first, mirroring the
-      // SDK's `materializeMainAgent` before `ISessionBtwService.start`.
-      await call({ sessionId, agentId: 'main' }, 'agentProfileService', 'getModel', []);
+      // SDK's `materializeMainAgent` before `ISessionBtwService.start`. The
+      // trigger is `data` (not `getModel`): it also succeeds on an unbound
+      // (model-less) agent.
+      await call({ sessionId, agentId: 'main' }, 'agentProfileService', 'data', []);
       return call(scope, 'sessionBtwService', 'start', []) as Promise<string>;
     },
     getSessionWarnings: async () => {
@@ -313,6 +374,33 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
         throw new RPCError(NOT_FOUND, `secondary model not configured: ${secondary.model}`);
       }
       await call(scope, 'sessionSecondaryModelWarningService', 'recheckSecondaryModelWarning', []);
+    },
+    recheckSecondaryModelWarning: async () => {
+      await call(scope, 'sessionSecondaryModelWarningService', 'recheckSecondaryModelWarning', []);
+    },
+    listSkills: () =>
+      call(scope, 'sessionSkillCatalog', 'listSkills', []) as Promise<readonly SkillSummary[]>,
+    context: async () => {
+      const [cwd, sessionDir, additionalDirs] = await Promise.all([
+        call(scope, 'sessionContext', 'cwd', []) as Promise<string>,
+        call(scope, 'sessionContext', 'sessionDir', []) as Promise<string>,
+        call(scope, 'sessionWorkspaceContext', 'additionalDirs', []) as Promise<readonly string[]>,
+      ]);
+      return { cwd, sessionDir, additionalDirs };
+    },
+    generateAgentsMd: () =>
+      call(scope, 'sessionInitService', 'generateAgentsMd', []) as Promise<void>,
+    materializeAgent: async (agentId) => {
+      await call(scope, 'agentLifecycleService', 'create', [{ agentId }]);
+    },
+    listLiveAgents: async () => {
+      const handles = (await call(scope, 'agentLifecycleService', 'list', [])) as readonly {
+        id: string;
+      }[];
+      return handles.map((handle) => handle.id);
+    },
+    reconnectMcpServer: async (name) => {
+      await call({ sessionId, agentId: 'main' }, 'agentMcpService', 'reconnect', [name]);
     },
 
     approvals: {

@@ -38,4 +38,6 @@ export const agentMcpContract = {
   list: { input: z.tuple([]), output: z.array(mcpServerEntrySchema) },
   waitForInitialLoad: { input: z.tuple([]), output: noResult },
   initialLoadDurationMs: { input: z.tuple([]), output: z.number() },
+  // The optional `AbortSignal` never crosses the wire.
+  reconnect: { input: z.tuple([z.string()]), output: noResult },
 } satisfies ServiceContract;

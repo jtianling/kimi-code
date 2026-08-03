@@ -24,6 +24,8 @@ import type {
 import type { AgentContextData } from '@moonshot-ai/agent-core-v2/agent/contextMemory/types';
 import type { FullCompactionInput } from '@moonshot-ai/agent-core-v2/agent/fullCompaction/fullCompaction';
 import type { ProfileUpdateData } from '@moonshot-ai/agent-core-v2/agent/profile/profile';
+import type { ModelCapability } from '@moonshot-ai/agent-core-v2/kosong/contract/capability';
+import type { ContextSize } from '@moonshot-ai/agent-core-v2/agent/contextSize/contextSize';
 import type {
   GoalReasonInput,
   ResumeGoalInput,
@@ -68,6 +70,24 @@ import type {
   CreateSessionOptions,
   ForkSessionOptions,
 } from '@moonshot-ai/agent-core-v2/workspace/sessionLifecycle/sessionLifecycle';
+import type {
+  BindAgentInput,
+  ProfileData,
+} from '@moonshot-ai/agent-core-v2/agent/profile/profile';
+import type { AgentLoopStatus } from '@moonshot-ai/agent-core-v2/agent/loop/loop';
+import type { SkillActivationInput } from '@moonshot-ai/agent-core-v2/agent/skill/skill';
+import type { CreateAgentOptions } from '@moonshot-ai/agent-core-v2/session/agentLifecycle/agentLifecycle';
+import type {
+  ExportSessionManifest,
+  ExportSessionPayload,
+  ExportSessionResult,
+} from '@moonshot-ai/agent-core-v2/app/sessionExport/sessionExport';
+import type { SkillDiscoveryResult } from '@moonshot-ai/agent-core-v2/app/skillCatalog/skillDiscovery';
+import type {
+  SkillDefinition,
+  SkillRoot,
+  SkippedSkill,
+} from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -189,10 +209,28 @@ import {
   usageStatusSchema,
 } from '../src/contract/agent/rpc.js';
 import {
+  contextSizeSchema,
   fullCompactionInputSchema,
+  modelCapabilitySchema,
   profileUpdateDataSchema,
   swarmModeTriggerSchema,
+  bindAgentInputSchema,
+  profileDataSchema,
 } from '../src/contract/agent/services.js';
+import { agentLoopStatusSchema } from '../src/contract/agent/loop.js';
+import { skillActivationInputSchema } from '../src/contract/agent/skill.js';
+import { createAgentOptionsSchema } from '../src/contract/agent/lifecycle.js';
+import {
+  exportSessionManifestSchema,
+  exportSessionPayloadSchema,
+  exportSessionResultSchema,
+} from '../src/contract/global/export.js';
+import {
+  skillDefinitionSchema,
+  skillDiscoveryResultSchema,
+  skillRootSchema,
+  skippedSkillSchema,
+} from '../src/contract/global/skillDiscovery.js';
 import { skillSummarySchema } from '../src/contract/session/skillCatalog.js';
 import { mcpServerEntrySchema } from '../src/contract/agent/mcp.js';
 import { secondaryModelWarningSchema } from '../src/contract/session/secondaryModelWarning.js';
@@ -607,6 +645,8 @@ const _undoHistoryPayload: AssertWire<typeof undoHistoryPayloadSchema, UndoHisto
 // `active` flag, which the declared `ToolInfo` type does not include.
 type GetToolsRow = Awaited<ReturnType<AgentAPI['getTools']>>[number];
 const _toolInfo: AssertWireToEngine<typeof toolInfoSchema, GetToolsRow> = true;
+const _modelCapability: AssertWire<typeof modelCapabilitySchema, ModelCapability> = true;
+const _contextSize: AssertWire<typeof contextSizeSchema, ContextSize> = true;
 
 // ── agent scope (events.ts) ─────────────────────────────────────────────────
 // Parity against the protocol event types (the stream carries flat
@@ -630,3 +670,37 @@ const _warningEvent: AssertWire<typeof warningEventSchema, WarningEvent> = true;
 // and `agentStatusUpdatedEventSchema`: they are deliberately `z.looseObject`s
 // (index signature breaks both-ways assignability) — `permission.approval.*`
 // is not part of the protocol event union at all.
+
+// ── SDK-migration additions (profile bind/data, loop, skill, lifecycle) ─────
+const _bindAgentInput: AssertWire<typeof bindAgentInputSchema, BindAgentInput> = true;
+const _profileData: AssertWire<typeof profileDataSchema, ProfileData> = true;
+const _agentLoopStatus: AssertWire<typeof agentLoopStatusSchema, AgentLoopStatus> = true;
+const _skillActivationInput: AssertWire<typeof skillActivationInputSchema, SkillActivationInput> =
+  true;
+// One-directional (wire → engine): the wire mirrors only the `agentId` slice
+// of `CreateAgentOptions` (binding / forkedFrom / labels stay in-process).
+const _createAgentOptions: AssertWireToEngine<typeof createAgentOptionsSchema, CreateAgentOptions> =
+  true;
+
+// ── SDK-migration additions (session export / skill discovery) ──────────────
+const _exportSessionPayload: AssertWire<typeof exportSessionPayloadSchema, ExportSessionPayload> =
+  true;
+const _exportSessionManifest: AssertWire<
+  typeof exportSessionManifestSchema,
+  ExportSessionManifest
+> = true;
+const _exportSessionResult: AssertWire<typeof exportSessionResultSchema, ExportSessionResult> =
+  true;
+const _skillRoot: AssertWire<typeof skillRootSchema, SkillRoot> = true;
+const _skippedSkill: AssertWire<typeof skippedSkillSchema, SkippedSkill> = true;
+// One-directional: `SkillMetadata` / `SkillPluginContext` are open maps
+// mirrored as `z.looseObject`s (index signature breaks the reverse
+// direction), so only the engine → wire direction holds.
+const _skillDefinition: AssertEngineToWire<typeof skillDefinitionSchema, SkillDefinition> = true;
+const _skillDiscoveryResult: AssertEngineToWire<
+  typeof skillDiscoveryResultSchema,
+  SkillDiscoveryResult
+> = true;
+// No parity assertions for `contextMessageSchema` / `globalEventSchema` /
+// `compacting`: deliberately loose mirrors (`unknown` leaves / loose objects)
+// whose consumers only need the carried fields or a null check.

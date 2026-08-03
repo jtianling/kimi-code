@@ -72,3 +72,74 @@ describe('ipc transport specifics', () => {
     await teardown();
   });
 });
+
+describe('session/agent facade over ipc (direction-B migrated paths)', () => {
+  let engine: TestEngine;
+  let host: KlientIpcHost;
+  let klient: ReturnType<typeof createKlient>;
+  let sessionId: string;
+
+  async function setup(): Promise<void> {
+    engine = await makeEngine();
+    const socketPath = join(engine.homeDir, 'klient.sock');
+    host = await serveKlientIpc({ scope: engine.app, socketPath });
+    klient = createKlient({ socketPath });
+    await klient.global.config.replaceSections({
+      sections: {
+        providers: {
+          'ipc-facade': { type: 'openai', baseUrl: 'http://127.0.0.1:1', apiKey: 'k' },
+        },
+        models: {
+          'ipc-facade/m1': { provider: 'ipc-facade', model: 'm1', maxContextSize: 8192 },
+        },
+        defaultModel: 'ipc-facade/m1',
+      },
+    });
+    const created = await klient.global.sessions.create({
+      workDir: process.cwd(),
+      title: 'ipc facade paths',
+    });
+    sessionId = created.id;
+  }
+
+  async function teardown(): Promise<void> {
+    await klient.close();
+    await host.close();
+    engine.app.dispose();
+    await rm(engine.homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+  }
+
+  it('serves MCP list, warnings, cron, and context across the socket', async () => {
+    await setup();
+    try {
+      const session = klient.session(sessionId);
+      const agent = session.agent('main');
+
+      expect(Array.isArray(await session.listMcpServers())).toBe(true);
+      expect((await session.getMcpStartupMetrics()).durationMs).toBeGreaterThanOrEqual(0);
+      expect(Array.isArray(await session.getSessionWarnings())).toBe(true);
+      expect((await session.getCronTasks()).tasks).toEqual([]);
+
+      const context = await agent.getContext();
+      expect(context).toHaveProperty('history');
+    } finally {
+      await teardown();
+    }
+  }, 60_000);
+
+  it('drives the goal lifecycle across the socket', async () => {
+    await setup();
+    try {
+      const agent = klient.session(sessionId).agent('main');
+      const created = await agent.createGoal({ objective: 'ipc goal' });
+      expect(created.status).toBe('active');
+      expect((await agent.getGoal()).goal?.goalId).toBe(created.goalId);
+      expect((await agent.pauseGoal()).status).toBe('paused');
+      expect((await agent.resumeGoal()).status).toBe('active');
+      expect((await agent.cancelGoal()).goalId).toBe(created.goalId);
+      expect((await agent.getGoal()).goal).toBeNull();
+    } finally {
+      await teardown();
+    }
+  }, 60_000);
+});

@@ -40,14 +40,66 @@ export const profileUpdateDataSchema = z.object({
   activeToolNames: z.array(z.string()).optional(),
 });
 
+/** `ModelCapability` (`agent-core-v2/kosong/contract/capability.ts`). */
+export const modelCapabilitySchema = z.object({
+  image_in: z.boolean(),
+  video_in: z.boolean(),
+  audio_in: z.boolean(),
+  thinking: z.boolean(),
+  tool_use: z.boolean(),
+  max_context_tokens: z.number(),
+  max_input_tokens: z.number().optional(),
+  dynamically_loaded_tools: z.boolean().optional(),
+});
+
+/** `ContextSize` (`agent-core-v2/agent/contextSize/contextSize.ts`). */
+export const contextSizeSchema = z.object({
+  size: z.number(),
+  measured: z.number(),
+  estimated: z.number(),
+});
+
+/** `BindAgentInput` (`agent-core-v2/agent/profile/profile.ts`). */
+export const bindAgentInputSchema = z.object({
+  profile: z.string(),
+  model: z.string().optional(),
+  thinking: z.string().optional(),
+  strictThinking: z.boolean().optional(),
+});
+
+/**
+ * `ProfileData` (`agent-core-v2/agent/profile/profile.ts`) — the agent's bound
+ * profile snapshot. `systemPrompt` may be absent on an unbound agent.
+ */
+export const profileDataSchema = z.object({
+  modelAlias: z.string().optional(),
+  modelCapabilities: modelCapabilitySchema,
+  profileName: z.string().optional(),
+  thinkingLevel: z.string(),
+  systemPrompt: z.string(),
+  activeToolNames: z.array(z.string()).optional(),
+  disallowedTools: z.array(z.string()).optional(),
+  subagents: z.array(z.string()).optional(),
+});
+
 export const agentProfileContract = {
   getModel: { input: z.tuple([]), output: z.string() },
   setModel: { input: z.tuple([z.string()]), output: setModelResultSchema },
   setThinking: { input: z.tuple([z.string()]), output: noResult },
   update: { input: z.tuple([profileUpdateDataSchema]), output: noResult },
+  bind: { input: z.tuple([bindAgentInputSchema]), output: noResult },
+  data: { input: z.tuple([]), output: profileDataSchema },
   // The cached oversized-AGENTS.md notice (computed on every profile bind);
   // the session facade folds it into `getSessionWarnings`.
   getAgentsMdWarning: { input: z.tuple([]), output: maybe(z.string()) },
+  getModelCapabilities: { input: z.tuple([]), output: modelCapabilitySchema },
+} satisfies ServiceContract;
+
+export const agentContextSizeContract = {
+  get: {
+    input: z.tuple([z.number().optional(), z.number().optional()]),
+    output: contextSizeSchema,
+  },
 } satisfies ServiceContract;
 
 export const agentUsageContract = {
@@ -76,6 +128,12 @@ export const agentTaskContract = {
     output: z.string(),
   },
   detach: { input: z.tuple([z.string()]), output: maybe(agentTaskInfoSchema) },
+  suppressTerminalNotification: { input: z.tuple([z.string()]), output: noResult },
+  // The optional `signal` never crosses the wire.
+  wait: {
+    input: z.tuple([z.string(), z.number().optional()]),
+    output: maybe(agentTaskInfoSchema),
+  },
 } satisfies ServiceContract;
 
 /** `SwarmModeTrigger` (`agent-core-v2/agent/swarm/swarm.ts`). */
@@ -84,6 +142,8 @@ export const swarmModeTriggerSchema = z.enum(['manual', 'task', 'tool']);
 export const agentSwarmContract = {
   enter: { input: z.tuple([swarmModeTriggerSchema]), output: noResult },
   exit: { input: z.tuple([]), output: noResult },
+  // Property read (`readonly isActive`), not a method — empty input tuple.
+  isActive: { input: z.tuple([]), output: z.boolean() },
 } satisfies ServiceContract;
 
 /**
@@ -100,4 +160,7 @@ export const fullCompactionInputSchema = z.object({
 
 export const agentFullCompactionContract = {
   begin: { input: z.tuple([fullCompactionInputSchema]), output: z.boolean() },
+  // Property read (`readonly compacting: FullCompactionTask | null`). The task
+  // handle does not cross the wire meaningfully; consumers only null-check it.
+  compacting: { input: z.tuple([]), output: maybe(z.unknown()) },
 } satisfies ServiceContract;

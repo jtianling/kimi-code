@@ -354,3 +354,237 @@ describe('session facade cron & secondary model (real engine)', () => {
     await expect(session.applyPersistedSecondaryModel()).resolves.toBeUndefined();
   });
 });
+
+/**
+ * Facade additions for the node-sdk v1-surface migration (real engine,
+ * memory transport): profile binding/state reads, permission state, context
+ * mutation, activations, agent/session lifecycle, workspace trust, export,
+ * skill discovery, and the event-bus publish. All pure state operations —
+ * no LLM round-trip.
+ */
+describe('sdk-migration facade additions (real engine)', () => {
+  let engine: TestEngine;
+  let klient: Klient;
+  let sessionId: string;
+
+  beforeAll(async () => {
+    engine = await makeEngine();
+    klient = createKlient({ scope: engine.app });
+    await klient.global.config.replaceSections({
+      sections: {
+        providers: {
+          'sdk-migration': { type: 'openai', baseUrl: 'http://127.0.0.1:1', apiKey: 'k' },
+        },
+        models: {
+          'sdk-migration/m1': { provider: 'sdk-migration', model: 'm1', maxContextSize: 8192 },
+        },
+        defaultModel: 'sdk-migration/m1',
+      },
+    });
+    const created = await klient.global.sessions.create({
+      workDir: process.cwd(),
+      title: 'sdk migration',
+    });
+    sessionId = created.id;
+  });
+
+  afterAll(async () => {
+    await klient.close();
+    engine.app.dispose();
+    await rm(engine.homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+  });
+
+  it('binds the default profile and exposes the profile snapshot', async () => {
+    const agent = klient.session(sessionId).agent('main');
+    const before = await agent.getProfileData();
+    await agent.bindProfile({ profile: 'agent' });
+    const after = await agent.getProfileData();
+    expect(after.profileName).toBe('agent');
+    expect(after.modelAlias).toBe('sdk-migration/m1');
+    expect(after.modelCapabilities.max_context_tokens).toBeGreaterThan(0);
+    expect(typeof after.thinkingLevel).toBe('string');
+    // A re-bind with an explicit model switches the alias.
+    await agent.bindProfile({ profile: 'agent', model: 'sdk-migration/m1' });
+    expect((await agent.getProfileData()).modelAlias).toBe('sdk-migration/m1');
+    expect(before).toBeDefined();
+  });
+
+  it('reads and drives the permission mode, and lists the rules', async () => {
+    const agent = klient.session(sessionId).agent('main');
+    expect(await agent.getPermissionMode()).toBe('manual');
+    await agent.setPermission('auto');
+    expect(await agent.getPermissionMode()).toBe('auto');
+    await agent.setPermission('manual');
+    expect(Array.isArray(await agent.getPermissionRules())).toBe(true);
+  });
+
+  it('exposes swarm / loop / activity / compaction state reads', async () => {
+    const agent = klient.session(sessionId).agent('main');
+    expect(await agent.isSwarmActive()).toBe(false);
+    await agent.setSwarmMode(true, 'manual');
+    expect(await agent.isSwarmActive()).toBe(true);
+    await agent.setSwarmMode(false, 'manual');
+
+    expect((await agent.getLoopStatus()).state).toBe('idle');
+    const activity = await agent.getActivityState();
+    expect(activity.turn).toBeUndefined();
+    expect(Array.isArray(activity.background)).toBe(true);
+    expect(await agent.getCompacting()).toBeUndefined();
+  });
+
+  it('appends and clears context messages through the memory service', async () => {
+    const fresh = await klient.global.sessions.create({
+      workDir: process.cwd(),
+      title: 'sdk migration context',
+    });
+    const agent = klient.session(fresh.id).agent('main');
+    const before = await agent.getContext();
+    await agent.appendContextMessage({
+      role: 'user',
+      content: [{ type: 'text', text: 'wire-appended' }],
+      toolCalls: [],
+      origin: { kind: 'user' },
+    } as never);
+    const after = await agent.getContext();
+    expect(after.history.length).toBe(before.history.length + 1);
+    await agent.clearContext();
+    expect((await agent.getContext()).history.length).toBe(0);
+  });
+
+  it('activates a skill with synchronous validation and rejects an unknown one', async () => {
+    const agent = klient.session(sessionId).agent('main');
+    await expect(agent.activateSkillAwaited('no-such-skill')).rejects.toThrow(/skill/i);
+    const skills = await klient.session(sessionId).listSkills();
+    const activatable = skills.find(
+      (skill) =>
+        skill.isSubSkill !== true &&
+        (skill.type === undefined || skill.type === 'prompt' || skill.type === 'flow'),
+    );
+    expect(activatable).toBeDefined();
+    await expect(agent.activateSkillAwaited(activatable!.name)).resolves.toBeUndefined();
+  });
+
+  it('rejects an unknown plugin command and reconnects an unknown MCP server', async () => {
+    const agent = klient.session(sessionId).agent('main');
+    await expect(
+      agent.activatePluginCommand({ pluginId: 'no-such', commandName: 'no-such' }),
+    ).rejects.toThrow();
+    await expect(
+      klient.session(sessionId).reconnectMcpServer('no-such-server'),
+    ).rejects.toThrow(/Unknown MCP server|not found|disabled/i);
+    await expect(klient.session(sessionId).recheckSecondaryModelWarning()).resolves.toBeUndefined();
+  });
+
+  it('stops and waits for unknown tasks without stamping a reason', async () => {
+    const agent = klient.session(sessionId).agent('main');
+    await expect(
+      agent.stopTaskWithReason({ taskId: 'no-such-task' }),
+    ).resolves.toBeUndefined();
+    await expect(agent.waitForTask('no-such-task', 25)).resolves.toBeUndefined();
+    await expect(agent.suppressTaskTerminalNotification('no-such-task')).resolves.toBeUndefined();
+  });
+
+  it('materializes agents and lists the live roster', async () => {
+    const session = klient.session(sessionId);
+    await session.materializeAgent('sdk-migration-sub');
+    const live = await session.listLiveAgents();
+    expect(live).toContain('main');
+    expect(live).toContain('sdk-migration-sub');
+  });
+
+  it('exposes the session context paths and additional dirs', async () => {
+    const session = klient.session(sessionId);
+    const ctx = await session.context();
+    expect(ctx.cwd.length).toBeGreaterThan(0);
+    expect(ctx.sessionDir.length).toBeGreaterThan(0);
+    expect(Array.isArray(ctx.additionalDirs)).toBe(true);
+  });
+
+  it('resumes a closed session (isLive round-trip) and forks with an explicit id', async () => {
+    const session = klient.session(sessionId);
+    expect(await session.isLive()).toBe(true);
+    await session.close();
+    expect(await session.isLive()).toBe(false);
+    expect(await session.resume()).toBe(true);
+    expect(await session.isLive()).toBe(true);
+
+    const forked = await session.fork({ newSessionId: 'sdk-migration-fork', title: 'fork' });
+    expect(forked.id).toBe('sdk-migration-fork');
+    expect((await klient.global.sessions.get('sdk-migration-fork'))?.id).toBe(
+      'sdk-migration-fork',
+    );
+  });
+
+  it('creates a session with an explicit id', async () => {
+    const meta = await klient.global.sessions.create({
+      workDir: process.cwd(),
+      id: 'sdk-migration-explicit',
+      title: 'explicit',
+    });
+    expect(meta.id).toBe('sdk-migration-explicit');
+    expect(meta.title).toBe('explicit');
+  });
+
+  it('resolves workspace trust and alias ids', async () => {
+    const trustedBefore = await klient.global.workspaces.getTrust(process.cwd());
+    await klient.global.workspaces.trust(process.cwd());
+    expect(await klient.global.workspaces.getTrust(process.cwd())).toBe(true);
+    expect(trustedBefore === true || trustedBefore === false).toBe(true);
+
+    const workspaces = await klient.global.workspaces.list();
+    const mine = workspaces.find((workspace) => workspace.root === process.cwd());
+    expect(mine).toBeDefined();
+    const aliasIds = await klient.global.workspaces.resolveAliasIds(mine!.id);
+    expect(aliasIds).toContain(mine!.id);
+  });
+
+  it('discovers skills over caller-supplied roots', async () => {
+    const home = await klient.global.env();
+    const result = await klient.global.skills.discover([
+      { path: join(home.osHomeDir, '.agents', 'skills'), source: 'user' },
+    ]);
+    expect(Array.isArray(result.skills)).toBe(true);
+    expect(Array.isArray(result.skipped)).toBe(true);
+    for (const skill of result.skills) {
+      expect(typeof skill.name).toBe('string');
+      expect(typeof skill.content).toBe('string');
+    }
+  });
+
+  it('exports a session as a zip archive', async () => {
+    const result = await klient.global.sessions.export({
+      sessionId,
+      version: '0.0.0-klient-test',
+    });
+    expect(typeof result.zipPath).toBe('string');
+    expect(result.manifest.sessionId).toBe(sessionId);
+    await rm(result.zipPath, { force: true });
+  });
+
+  it('publishes a global bus event that the events hub delivers', async () => {
+    const received: unknown[] = [];
+    const sub = klient.events.on('session.metaUpdated', (payload) => {
+      received.push(payload);
+    });
+    try {
+      await klient.global.publishEvent({
+        type: 'session.meta.updated',
+        payload: {
+          agentId: 'main',
+          sessionId,
+          title: 'published',
+          patch: { title: 'published', isCustomTitle: false, lastPrompt: 'published' },
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received.length).toBe(1);
+      expect((received[0] as { sessionId: string }).sessionId).toBe(sessionId);
+    } finally {
+      sub.dispose();
+    }
+  });
+
+  it('resolves the relative persistence scope names', async () => {
+    expect(await klient.global.envScope('sessions')).toBe('sessions');
+  });
+});

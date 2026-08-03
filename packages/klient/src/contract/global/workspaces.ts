@@ -33,3 +33,13 @@ export const workspacesContract = {
   },
   delete: { input: z.tuple([z.string()]), output: noResult },
 } satisfies ServiceContract;
+
+/**
+ * `workspaceAliases` (app scope) — every workspace-id bucket aliased to a
+ * registered workspace. Mirrors
+ * `agent-core-v2/app/workspaceAliases/workspaceAliases.ts`
+ * (`IWorkspaceAliases.resolveAliasIds`).
+ */
+export const workspaceAliasesContract = {
+  resolveAliasIds: { input: z.tuple([z.string()]), output: z.array(z.string()) },
+} satisfies ServiceContract;

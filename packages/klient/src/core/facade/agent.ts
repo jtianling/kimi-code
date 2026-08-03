@@ -8,13 +8,18 @@
  */
 
 import type { IAgentRPCService } from '@moonshot-ai/agent-core-v2/agent/rpc/rpc';
+import type { ContextMessage } from '@moonshot-ai/agent-core-v2/agent/contextMemory/types';
+import type { IAgentContextSizeService } from '@moonshot-ai/agent-core-v2/agent/contextSize/contextSize';
 import type { IAgentGoalService } from '@moonshot-ai/agent-core-v2/agent/goal/goal';
+import type { IAgentLoopService } from '@moonshot-ai/agent-core-v2/agent/loop/loop';
+import type { IAgentPermissionRulesService } from '@moonshot-ai/agent-core-v2/agent/permissionRules/permissionRules';
 import type { IAgentPlanService } from '@moonshot-ai/agent-core-v2/agent/plan/plan';
 import type { IAgentProfileService } from '@moonshot-ai/agent-core-v2/agent/profile/profile';
 import type { IAgentShellCommandService } from '@moonshot-ai/agent-core-v2/agent/shellCommand/shellCommand';
 import type { IAgentSwarmService, SwarmModeTrigger } from '@moonshot-ai/agent-core-v2/agent/swarm/swarm';
 import type { IAgentTaskService } from '@moonshot-ai/agent-core-v2/agent/task/task';
 import type { IAgentUsageService } from '@moonshot-ai/agent-core-v2/agent/usage/usage';
+import type { AgentActivityState } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
 import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 import type { ContentPart } from '@moonshot-ai/agent-core-v2/kosong/contract/message';
 import type { ThinkingEffort } from '@moonshot-ai/agent-core-v2/kosong/contract/provider';
@@ -31,10 +36,20 @@ export type SetModelResult = Awaited<ReturnType<IAgentProfileService['setModel']
 export type UsageStatus = Awaited<ReturnType<IAgentUsageService['status']>>;
 export type AgentContextData = Awaited<ReturnType<IAgentRPCService['getContext']>>;
 export type PlanData = Awaited<ReturnType<IAgentPlanService['status']>>;
+export type ModelCapability = ReturnType<IAgentProfileService['getModelCapabilities']>;
+export type ContextSize = ReturnType<IAgentContextSizeService['get']>;
 export type AgentTaskInfo = Awaited<ReturnType<IAgentTaskService['list']>>[number];
 export type CreateGoalInput = Parameters<IAgentGoalService['createGoal']>[0];
 export type GoalSnapshot = Awaited<ReturnType<IAgentGoalService['createGoal']>>;
 export type GoalToolResult = ReturnType<IAgentGoalService['getGoal']>;
+export type ProfileData = ReturnType<IAgentProfileService['data']>;
+export type BindProfileInput = Parameters<IAgentProfileService['bind']>[0];
+export type PermissionRule = IAgentPermissionRulesService['rules'][number];
+export type AgentLoopStatus = ReturnType<IAgentLoopService['status']>;
+export type ActivatePluginCommandInput = Parameters<
+  IAgentRPCService['activatePluginCommand']
+>[0];
+export type { AgentActivityState, ContextMessage };
 export type AgentToolInfo = Awaited<ReturnType<IAgentRPCService['getTools']>>[number] & {
   /** Resolved live from the tool policy at call time; the engine's declared
    * `ToolInfo` type omits it, but every wire row carries it. */
@@ -81,9 +96,46 @@ export interface AgentFacade {
   setThinking(effort: ThinkingEffort): Promise<void>;
   getTools(): Promise<readonly AgentToolInfo[]>;
   setActiveTools(tools: readonly string[]): Promise<void>;
+  // --- Model capabilities / context size (status snapshot enrichment) ---------
+  getModelCapabilities(): Promise<ModelCapability>;
+  getContextSize(): Promise<ContextSize>;
   // --- History / tasks -------------------------------------------------------
   undoHistory(count?: number): Promise<number>;
   detachBackgroundTask(taskId: string): Promise<AgentTaskInfo | undefined>;
+  /**
+   * `agentTaskService.stop` verbatim — unlike `stopTask`, a missing reason
+   * stays missing (no user-cancellation `stopReason` is stamped). Mirrors the
+   * v1 SDK `background.stop(taskId, reason)`.
+   */
+  stopTaskWithReason(input: { taskId: string; reason?: string }): Promise<void>;
+  suppressTaskTerminalNotification(taskId: string): Promise<void>;
+  /** Wait for a task to reach a terminal state (the optional AbortSignal stays off-wire). */
+  waitForTask(taskId: string, timeoutMs?: number): Promise<AgentTaskInfo | undefined>;
+  // --- Profile / permission state reads ---------------------------------------
+  /** Bind a profile (the default-profile materialization the v1 SDK applies eagerly). */
+  bindProfile(input: BindProfileInput): Promise<void>;
+  /** The bound profile snapshot (`profileName` absent while unbound). */
+  getProfileData(): Promise<ProfileData>;
+  getPermissionMode(): Promise<PermissionMode>;
+  getPermissionRules(): Promise<readonly PermissionRule[]>;
+  isSwarmActive(): Promise<boolean>;
+  getActivityState(): Promise<AgentActivityState>;
+  getLoopStatus(): Promise<AgentLoopStatus>;
+  /** The in-flight compaction task, when one is running (null-check only). */
+  getCompacting(): Promise<unknown>;
+  // --- Context mutation ---------------------------------------------------------
+  clearContext(): Promise<void>;
+  /** Append one context message (the engine's variadic `append`, one message per call). */
+  appendContextMessage(message: ContextMessage): Promise<void>;
+  // --- Activations -------------------------------------------------------------
+  /**
+   * `agentSkillService.activate` — the awaited variant of `activateSkill`:
+   * validates synchronously (`skill.not_found` / `skill.type_unsupported`)
+   * instead of fire-and-forget. Does NOT update the session prompt metadata;
+   * that stays with the caller (v1 updates it for the main agent only).
+   */
+  activateSkillAwaited(name: string, args?: string): Promise<void>;
+  activatePluginCommand(input: ActivatePluginCommandInput): Promise<void>;
 }
 
 export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFacade {
@@ -164,5 +216,38 @@ export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFac
     undoHistory: (count) => rpc('undoHistory', { count: count ?? 1 }) as Promise<number>,
     detachBackgroundTask: (taskId) =>
       call(scope, 'agentTaskService', 'detach', [taskId]) as Promise<AgentTaskInfo | undefined>,
+    stopTaskWithReason: async (input) => {
+      await call(scope, 'agentTaskService', 'stop', [input.taskId, input.reason]);
+    },
+    suppressTaskTerminalNotification: (taskId) =>
+      call(scope, 'agentTaskService', 'suppressTerminalNotification', [taskId]) as Promise<void>,
+    waitForTask: (taskId, timeoutMs) =>
+      call(scope, 'agentTaskService', 'wait', [taskId, timeoutMs]) as Promise<
+        AgentTaskInfo | undefined
+      >,
+    bindProfile: (input) =>
+      call(scope, 'agentProfileService', 'bind', [input]) as Promise<void>,
+    getProfileData: () => call(scope, 'agentProfileService', 'data', []) as Promise<ProfileData>,
+    getPermissionMode: () =>
+      call(scope, 'agentPermissionModeService', 'mode', []) as Promise<PermissionMode>,
+    getPermissionRules: () =>
+      call(scope, 'agentPermissionRulesService', 'rules', []) as Promise<readonly PermissionRule[]>,
+    isSwarmActive: () => call(scope, 'agentSwarmService', 'isActive', []) as Promise<boolean>,
+    getActivityState: () =>
+      call(scope, 'agentActivityView', 'state', []) as Promise<AgentActivityState>,
+    getLoopStatus: () => call(scope, 'agentLoopService', 'status', []) as Promise<AgentLoopStatus>,
+    getCompacting: () => call(scope, 'agentFullCompactionService', 'compacting', []),
+    clearContext: () => call(scope, 'agentContextMemoryService', 'clear', []) as Promise<void>,
+    appendContextMessage: (message) =>
+      call(scope, 'agentContextMemoryService', 'append', [message]) as Promise<void>,
+    activateSkillAwaited: async (name, args) => {
+      // The launched `Turn` handle does not cross the wire — drop it.
+      await call(scope, 'agentSkillService', 'activate', [{ name, args }]);
+    },
+    activatePluginCommand: (input) => rpc('activatePluginCommand', input) as Promise<void>,
+    getModelCapabilities: () =>
+      call(scope, 'agentProfileService', 'getModelCapabilities', []) as Promise<ModelCapability>,
+    getContextSize: () =>
+      call(scope, 'agentContextSizeService', 'get', []) as Promise<ContextSize>,
   };
 }

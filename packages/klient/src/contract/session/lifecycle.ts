@@ -49,7 +49,17 @@ export const workspaceLifecycleContract = {
 
 export const sessionLifecycleContract = {
   create: { input: z.tuple([createSessionOptionsSchema]), output: handleWireSchema },
-  resume: { input: z.tuple([z.string()]), output: maybe(handleWireSchema) },
+  // The live-handle lookup (undefined when the session is not materialized).
+  get: { input: z.tuple([z.string()]), output: maybe(handleWireSchema) },
+  resume: {
+    input: z.tuple([
+      z.string(),
+      z
+        .object({ additionalDirs: z.array(z.string()).optional() })
+        .optional(),
+    ]),
+    output: maybe(handleWireSchema),
+  },
   close: { input: z.tuple([z.string()]), output: noResult },
   archive: { input: z.tuple([z.string()]), output: noResult },
   restore: { input: z.tuple([z.string()]), output: maybe(handleWireSchema) },

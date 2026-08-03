@@ -61,6 +61,10 @@ export const catalogContract = {
   listModels: { input: z.tuple([]), output: z.array(modelCatalogItemSchema) },
   listProviders: { input: z.tuple([]), output: z.array(providerCatalogItemSchema) },
   getProvider: { input: z.tuple([z.string()]), output: providerCatalogItemSchema },
+  // Raw model resolution (`IModelCatalog.get`) — throws for an unknown alias.
+  // The resolved `Model` is a deep engine type; callers use this as a
+  // validation probe, so the output stays `unknown`.
+  get: { input: z.tuple([z.string()]), output: z.unknown() },
   setDefaultModel: { input: z.tuple([z.string()]), output: setDefaultModelResponseSchema },
   generate: {
     input: z.tuple([z.string(), generateInputSchema, generateParamsSchema]),

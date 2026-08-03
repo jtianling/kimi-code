@@ -207,7 +207,7 @@ describe('session facade routing', () => {
     await session.addAdditionalDir('/extra', { persist: false });
 
     expect(called()).toEqual([
-      'agentProfileService.getModel', // startBtw's main-agent materialization poke
+      'agentProfileService.data', // startBtw's main-agent materialization poke
       'sessionBtwService.start',
       'agentProfileService.getAgentsMdWarning',
       'sessionSecondaryModelWarningService.getSecondaryModelWarning',

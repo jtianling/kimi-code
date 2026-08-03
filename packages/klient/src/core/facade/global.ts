@@ -34,6 +34,8 @@ import type {
 import type { ModelRecord } from '@moonshot-ai/agent-core-v2/kosong/model/model';
 import type { IModelCatalog } from '@moonshot-ai/agent-core-v2/kosong/model/catalog';
 import type { IProviderDiscoveryService } from '@moonshot-ai/agent-core-v2/app/kosongConfig/discovery';
+import type { ISessionExportService } from '@moonshot-ai/agent-core-v2/app/sessionExport/sessionExport';
+import type { ISkillDiscovery } from '@moonshot-ai/agent-core-v2/app/skillCatalog/skillDiscovery';
 
 import type { AnonymousProviderInput, GenerateEvent, GenerateInput, GenerateParams, ProviderInput } from './kosong-types.js';
 import type {
@@ -100,15 +102,24 @@ export interface GlobalSessionsFacade {
   countActive(workspaceIds: readonly string[]): Promise<number>;
   /**
    * Create a session rooted at `workDir` (the workspace is registered
-   * implicitly), optionally titled. Returns the persisted metadata. No agent
-   * is created — `session(id).agent('main')` materializes it on first use.
+   * implicitly), optionally titled and/or with an explicit id. Returns the
+   * persisted metadata. No agent is created — `session(id).agent('main')`
+   * materializes it on first use.
    */
   create(input: {
     workDir: string;
     additionalDirs?: readonly string[];
     title?: string;
+    id?: string;
   }): Promise<SessionMeta>;
+  /** Export a session as a zip archive (app-scope `sessionExportService`). */
+  export(input: ExportSessionInput): Promise<ExportSessionResult>;
 }
+
+/** `ExportSessionPayload` (`agent-core-v2/app/sessionExport/sessionExport.ts`). */
+export type ExportSessionInput = Parameters<ISessionExportService['export']>[0];
+/** `ExportSessionResult` (`agent-core-v2/app/sessionExport/sessionExport.ts`). */
+export type ExportSessionResult = Awaited<ReturnType<ISessionExportService['export']>>;
 
 export interface GlobalWorkspacesFacade {
   list(): Promise<readonly Workspace[]>;
@@ -116,7 +127,30 @@ export interface GlobalWorkspacesFacade {
   createOrTouch(input: { root: string; name?: string }): Promise<Workspace>;
   update(input: { id: string; patch: WorkspaceUpdate }): Promise<Workspace | undefined>;
   delete(id: string): Promise<void>;
+  /** Every workspace-id bucket aliased to a registered workspace (`workspaceAliases`). */
+  resolveAliasIds(id: string): Promise<readonly string[]>;
+  /**
+   * Trust state of the workspace rooted at `root` (materializes the workspace
+   * handler — the same path session creation takes).
+   */
+  getTrust(root: string): Promise<boolean>;
+  /** Mark the workspace rooted at `root` trusted (project MCP config activates live). */
+  trust(root: string): Promise<void>;
 }
+
+export interface GlobalSkillsFacade {
+  /**
+   * Stateless skill scan over caller-supplied roots (app-scope
+   * `skillDiscovery`); root resolution and the builtin merge stay with the
+   * caller.
+   */
+  discover(roots: readonly SkillRoot[]): Promise<SkillDiscoveryResult>;
+}
+
+/** `SkillRoot` (`agent-core-v2/app/skillCatalog/types.ts`), via the service interface. */
+export type SkillRoot = Parameters<ISkillDiscovery['discover']>[0][number];
+/** `SkillDiscoveryResult` (`agent-core-v2/app/skillCatalog/skillDiscovery.ts`). */
+export type SkillDiscoveryResult = Awaited<ReturnType<ISkillDiscovery['discover']>>;
 
 export interface GlobalConfigFacade {
   get<T = unknown>(domain: string): Promise<T>;
@@ -153,6 +187,12 @@ export interface GlobalKosongFacade {
 
   // -- Model ------------------------------------------------------------
   listModels(): Promise<readonly ModelCatalogItem[]>;
+  /**
+   * Raw model resolution (`IModelCatalog.get`) — rejects for an unknown
+   * alias. A validation probe: the resolved `Model` stays engine-typed, so
+   * the wire returns it as `unknown`.
+   */
+  getModel(id: string): Promise<unknown>;
   setDefaultModel(id: string): Promise<SetDefaultModelResponse>;
 
   // -- Generate (streaming) -----------------------------------------------
@@ -228,8 +268,24 @@ export interface GlobalFacade {
   readonly flags: GlobalFlagsFacade;
   readonly plugins: GlobalPluginsFacade;
   readonly hostFs: GlobalHostFsFacade;
+  readonly skills: GlobalSkillsFacade;
   env(): Promise<KlientEnvInfo>;
+  /** Relative persistence scope path (`bootstrapService.scope`, e.g. `'sessions'`). */
+  envScope(name: PersistenceScopeName): Promise<string>;
+  /** Publish an event onto the process-global bus (app-scope `eventService`). */
+  publishEvent(event: { type: string; payload: unknown }): Promise<void>;
 }
+
+/** String-literal form of the engine's `PersistenceScopeName`. */
+export type PersistenceScopeName =
+  | 'config'
+  | 'sessions'
+  | 'blobs'
+  | 'store'
+  | 'logs'
+  | 'cache'
+  | 'credentials'
+  | 'cron';
 
 // ---------------------------------------------------------------------------
 // Implementation — thin reshaping over `Caller`. Casts are safe by
@@ -280,14 +336,14 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
       get: (id) => call('sessionIndex', 'get', [id]) as Promise<SessionSummary | undefined>,
       countActive: (workspaceIds) =>
         call('sessionIndex', 'countActive', [workspaceIds]) as Promise<number>,
-      create: async ({ workDir, additionalDirs, title }) => {
+      create: async ({ workDir, additionalDirs, title, id }) => {
         // The workspace handler owns session creation: materialize (or reuse)
         // the handler for the root, then create under it.
         const handler = (await scoped({}, 'workspaceLifecycleService', 'handlerFor', [
           { root: workDir },
         ])) as { id: string };
         const handle = (await scoped({ workspaceId: handler.id }, 'sessionLifecycleService', 'create', [
-          { workDir, additionalDirs },
+          { workDir, additionalDirs, sessionId: id },
         ])) as { id: string };
         const scope = { sessionId: handle.id };
         if (title !== undefined) {
@@ -295,6 +351,7 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
         }
         return scoped(scope, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
       },
+      export: (input) => call('sessionExportService', 'export', [input]) as Promise<ExportSessionResult>,
     },
 
     workspaces: {
@@ -305,6 +362,25 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
       update: ({ id, patch }) =>
         call('workspaceService', 'update', [id, patch]) as Promise<Workspace | undefined>,
       delete: (id) => call('workspaceService', 'delete', [id]) as Promise<void>,
+      resolveAliasIds: (id) =>
+        call('workspaceAliases', 'resolveAliasIds', [id]) as Promise<readonly string[]>,
+      getTrust: async (root) => {
+        const handler = (await scoped({}, 'workspaceLifecycleService', 'handlerFor', [
+          { root },
+        ])) as { id: string };
+        return scoped({ workspaceId: handler.id }, 'workspaceTrust', 'get', []) as Promise<boolean>;
+      },
+      trust: async (root) => {
+        const handler = (await scoped({}, 'workspaceLifecycleService', 'handlerFor', [
+          { root },
+        ])) as { id: string };
+        await scoped({ workspaceId: handler.id }, 'workspaceTrust', 'trust', []);
+      },
+    },
+
+    skills: {
+      discover: (roots) =>
+        call('skillDiscovery', 'discover', [roots]) as Promise<SkillDiscoveryResult>,
     },
 
     config: {
@@ -388,6 +464,7 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
 
       listModels: () =>
         call('modelResolver', 'listModels', []) as Promise<readonly ModelCatalogItem[]>,
+      getModel: (id) => call('modelResolver', 'get', [id]),
       setDefaultModel: (id) =>
         call('modelResolver', 'setDefaultModel', [id]) as Promise<SetDefaultModelResponse>,
 
@@ -442,5 +519,9 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
     },
 
     env,
+
+    envScope: (name) => call('bootstrapService', 'scope', [name]) as Promise<string>,
+
+    publishEvent: (event) => call('eventService', 'publish', [event]) as Promise<void>,
   };
 }

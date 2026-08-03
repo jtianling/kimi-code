@@ -115,6 +115,17 @@ export const errorEventSchema = z.looseObject({
   message: z.string(),
 });
 
+/**
+ * Raw, full-fidelity agent event — the whole flat `{ type, ... }` bus event,
+ * unfiltered. For clients that need bus types outside the curated set above
+ * (e.g. the SDK's v1 event re-projection, which drops/renames types itself).
+ * Deliberately loose: the curated registrations own per-type parity.
+ */
+export const rawAgentEventSchema = z.looseObject({
+  type: z.string(),
+});
+export type RawAgentEvent = z.infer<typeof rawAgentEventSchema>;
+
 export const warningEventSchema = z.object({
   type: z.literal('warning'),
   message: z.string(),
@@ -143,6 +154,7 @@ export interface AgentEventPayloads {
   error: z.infer<typeof errorEventSchema>;
   warning: z.infer<typeof warningEventSchema>;
   'agent.status.updated': z.infer<typeof agentStatusUpdatedEventSchema>;
+  'events.raw': RawAgentEvent;
 }
 
 export type AgentEventName = keyof AgentEventPayloads;
@@ -177,4 +189,7 @@ export const agentEvents = {
     type: 'agent.status.updated',
     schema: agentStatusUpdatedEventSchema,
   },
+  // No `type` filter: the hub forwards every event on the agent bus whole.
+  // Shares the underlying channel subscription with the typed registrations.
+  'events.raw': { kind: 'stream', name: 'events', schema: rawAgentEventSchema },
 } satisfies Record<AgentEventName, AgentEventRegistration>;
