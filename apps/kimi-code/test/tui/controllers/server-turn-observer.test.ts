@@ -409,3 +409,26 @@ describe('ServerTurnObserver', () => {
     expect(FakeWs.instances).toHaveLength(1);
   });
 });
+
+describe('remote (one-engine) mode', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWs.instances.length = 0;
+    setExperimentalFeatures([{ id: 'tui-server-sync', enabled: true }]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    setExperimentalFeatures([]);
+  });
+
+  it('stays inert even with the sync flag enabled', async () => {
+    const { host } = makeHost();
+    (host as { remoteEngine: boolean }).remoteEngine = true;
+    const observer = makeObserver(host);
+    observer.setSessionId('sess-1');
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(FakeWs.instances).toHaveLength(0);
+    observer.dispose();
+  });
+});

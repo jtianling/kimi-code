@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import {
   createKimiHarness,
   createKimiHarnessV2,
+  createKimiHarnessV2Remote,
   flushDiagnosticLogsSync,
   log,
+  resolveKimiHome,
   type KimiHarness,
   type KimiHarnessOptions,
   type TelemetryClient,
@@ -33,6 +35,7 @@ import { restoreTerminalModes } from '#/utils/terminal-restore';
 import type { CLIOptions } from './options';
 import { resolveAgentProfileSelection } from './agent-selection';
 import { isKimiV2Enabled } from './experimental-v2';
+import { resolveRemoteConnection } from './remote';
 import { createCliTelemetryBootstrap, initializeCliTelemetry } from './telemetry';
 import { createKimiCodeHostIdentity } from './version';
 
@@ -85,9 +88,16 @@ export async function runShell(
   // harness is the SDK's v2-backed client, so the whole TUI runs on the
   // agent-core-v2 engine.
   const engineV2 = isKimiV2Enabled();
-  const harness = engineV2
-    ? createKimiHarnessV2(harnessOptions)
-    : createKimiHarness(harnessOptions);
+  // Remote (one-engine) route: attach to a kap-server-hosted engine over a
+  // unix socket instead of bootstrapping an in-process one. Opt-in via
+  // KIMI_REMOTE / KIMI_REMOTE_SOCKET; see cli/remote.ts.
+  const remote = await resolveRemoteConnection(resolveKimiHome(harnessOptions.homeDir));
+  const harness =
+    remote !== undefined
+      ? createKimiHarnessV2Remote(harnessOptions, remote)
+      : engineV2
+        ? createKimiHarnessV2(harnessOptions)
+        : createKimiHarness(harnessOptions);
   log.info('kimi-code starting', {
     version,
     uiMode: CLI_UI_MODE,
@@ -126,6 +136,7 @@ export async function runShell(
     migrationPlan,
     migrateOnly: runOptions.migrateOnly,
     engineV2,
+    remoteEngine: remote !== undefined,
   });
 
   initializeCliTelemetry({

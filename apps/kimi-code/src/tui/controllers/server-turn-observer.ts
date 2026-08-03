@@ -80,6 +80,11 @@ interface ServerFrame {
 export interface ServerTurnObserverHost {
   readonly harness: { readonly homeDir: string };
   readonly session: Session | undefined;
+  /**
+   * Remote (one-engine) mode: the harness drives the server-hosted engine, so
+   * the TUI's turns ARE the server turns — the observer stays inert.
+   */
+  readonly remoteEngine: boolean;
   readonly state: {
     readonly appState: Pick<AppState, 'streamingPhase' | 'isReplaying' | 'isCompacting'>;
   };
@@ -164,6 +169,12 @@ export class ServerTurnObserver {
     this.teardown();
     this.sessionId = sessionId;
     if (sessionId === undefined) return;
+    if (this.host.remoteEngine) {
+      // One-engine mode: this TUI's turns are the server turns — nothing
+      // external to observe, and subscribing would gate our own input.
+      this.debug(`setSessionId ${sessionId}: remote engine, observer inert`);
+      return;
+    }
     if (!isExperimentalFlagEnabled(SERVER_SYNC_FLAG)) {
       this.debug(`setSessionId ${sessionId}: flag disabled, observer inert`);
       return;

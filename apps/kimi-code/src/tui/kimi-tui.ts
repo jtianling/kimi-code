@@ -190,6 +190,12 @@ export interface KimiTUIStartupInput {
   readonly migrateOnly?: boolean;
   /** agent-core-v2 engine (KIMI_CODE_EXPERIMENTAL_FLAG); enables the startup workspace-trust prompt. */
   readonly engineV2?: boolean;
+  /**
+   * Remote (one-engine) mode: the harness drives a kap-server-hosted engine
+   * over a unix socket. The server-turn observer stays inert — the TUI's own
+   * turns ARE the server turns.
+   */
+  readonly remoteEngine?: boolean;
 }
 
 type EffectiveActivityPaneMode = ActivityPaneMode | 'idle' | 'session';
@@ -330,6 +336,7 @@ export class KimiTUI {
   private readonly migrationPlan: MigrationPlan | null;
   private readonly migrateOnly: boolean;
   private readonly engineV2: boolean;
+  readonly remoteEngine: boolean;
   private startupNotice: string | undefined;
   private lastActivityMode: string | undefined;
   private currentLoadingTip: { kind: LoadingTipKind; tip: string | undefined } | undefined =
@@ -405,6 +412,7 @@ export class KimiTUI {
     this.migrationPlan = startupInput.migrationPlan ?? null;
     this.migrateOnly = startupInput.migrateOnly ?? false;
     this.engineV2 = startupInput.engineV2 ?? false;
+    this.remoteEngine = startupInput.remoteEngine ?? false;
     this.startupNotice = startupInput.startupNotice;
     this.state = createTUIState(tuiOptions);
     this.uninstallRainbowDance = installRainbowDance(() => {
