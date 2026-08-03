@@ -1,13 +1,20 @@
 /**
  * The session facade — one `klient.session(id)` handle aggregating the
  * session-scope services (metadata, activity, approvals, questions,
- * interactions) plus the app-scope lifecycle service for close/archive/
- * restore/fork/createChild. `agents()` reads the metadata registry (agent
- * handles are not serializable, so no agent-lifecycle channel exists on the
- * wire).
+ * interactions, btw, warnings) plus the app-scope lifecycle service for
+ * close/archive/restore/fork/createChild and the workspace-scope
+ * `workspaceDirs` for addAdditionalDir. The MCP reads and the AGENTS.md half
+ * of the warnings ride the main agent's scope (resolution materializes it —
+ * the same `ensureMainAgent` the server's routes perform). `agents()` reads
+ * the metadata registry (agent handles are not serializable, so no
+ * agent-lifecycle channel exists on the wire).
  */
 
 import type { AgentActivityState } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
+import type { IAgentMcpService } from '@moonshot-ai/agent-core-v2/agent/mcp/mcp';
+import type { SessionWarning } from '@moonshot-ai/agent-core-v2/app/sessionLegacy/sessionProtocol';
+import type { SecondaryModelWarning } from '@moonshot-ai/agent-core-v2/session/subagent/secondaryModelWarning';
+import type { IWorkspaceDirs } from '@moonshot-ai/agent-core-v2/workspace/workspaceDirs/workspaceDirs';
 import type {
   AgentMeta,
   SessionMeta,
@@ -63,6 +70,23 @@ export interface SessionInteractionsFacade {
  */
 export type SessionStatus = 'running' | 'idle' | 'awaiting_approval' | 'awaiting_question';
 
+export type { SessionWarning };
+
+/**
+ * One configured MCP server as the workspace handler's shared connection
+ * manager reports it (`McpServerEntry` — field-identical with the v1
+ * `McpServerInfo` wire shape).
+ */
+export type McpServerInfo = Awaited<ReturnType<IAgentMcpService['list']>>[number];
+
+/** v1's `McpStartupMetrics` — the initial-connect wall-clock duration. */
+export interface McpStartupMetrics {
+  readonly durationMs: number;
+}
+
+/** What `IWorkspaceDirs.addDir` leaves on the wire. */
+export type AddAdditionalDirResult = Awaited<ReturnType<IWorkspaceDirs['addDir']>>;
+
 export interface SessionFacade {
   get(): Promise<SessionMeta>;
   setTitle(title: string): Promise<void>;
@@ -78,6 +102,31 @@ export interface SessionFacade {
     title?: string;
     metadata?: Record<string, unknown>;
   }): Promise<SessionMeta>;
+  /**
+   * Fork the main agent into a side-question ("btw") child; resolves with the
+   * child's agent id (mirrors the v1 SDK `Session.startBtw`).
+   */
+  startBtw(): Promise<string>;
+  /**
+   * Session-level notices in the v1 wire shape, composed from the profile's
+   * cached AGENTS.md warning (main agent) and the secondary-model warning —
+   * the same two sources kap-server's `GET /sessions/{id}/warnings` folds.
+   */
+  getSessionWarnings(): Promise<readonly SessionWarning[]>;
+  /**
+   * Configured MCP servers of the session's workspace handler (mirrors the v1
+   * SDK `Session.listMcpServers`). The agent scope is only the access path —
+   * the connection set is shared by the whole workspace.
+   */
+  listMcpServers(): Promise<readonly McpServerInfo[]>;
+  /** Initial MCP connect wall-clock duration (v1 `getMcpStartupMetrics`). */
+  getMcpStartupMetrics(): Promise<McpStartupMetrics>;
+  /**
+   * Add an additional working directory through the session's workspace
+   * handler (`IWorkspaceDirs`, workspace scope — resolved like close/archive).
+   * `persist` defaults to the engine default (`true` → `.kimi-code/local.toml`).
+   */
+  addAdditionalDir(path: string, options?: { persist?: boolean }): Promise<AddAdditionalDirResult>;
   readonly approvals: SessionApprovalsFacade;
   readonly questions: SessionQuestionsFacade;
   readonly interactions: SessionInteractionsFacade;
@@ -162,6 +211,53 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
     },
     fork: (input) => spawn('fork', input),
     createChild: (input) => spawn('createChild', input),
+
+    startBtw: async () => {
+      // `fork('main')` throws on a missing source, and `create` (unlike
+      // `resume`) does not eagerly materialize the main agent — force
+      // materialization through a main-agent-scope call first, mirroring the
+      // SDK's `materializeMainAgent` before `ISessionBtwService.start`.
+      await call({ sessionId, agentId: 'main' }, 'agentProfileService', 'getModel', []);
+      return call(scope, 'sessionBtwService', 'start', []) as Promise<string>;
+    },
+    getSessionWarnings: async () => {
+      // `agentId: 'main'` scope resolution materializes the main agent — the
+      // same `ensureMainAgent` the server's warnings route performs.
+      const [agentsMdWarning, secondary] = await Promise.all([
+        call({ sessionId, agentId: 'main' }, 'agentProfileService', 'getAgentsMdWarning', []) as
+          Promise<string | undefined>,
+        call(scope, 'sessionSecondaryModelWarningService', 'getSecondaryModelWarning', []) as
+          Promise<SecondaryModelWarning | undefined>,
+      ]);
+      const warnings: SessionWarning[] = [];
+      if (agentsMdWarning !== undefined) {
+        warnings.push({ code: 'agents-md-oversized', message: agentsMdWarning, severity: 'warning' });
+      }
+      if (secondary !== undefined) {
+        warnings.push({ code: secondary.code, message: secondary.message, severity: 'warning' });
+      }
+      return warnings;
+    },
+    listMcpServers: () =>
+      call({ sessionId, agentId: 'main' }, 'agentMcpService', 'list', []) as Promise<
+        readonly McpServerInfo[]
+      >,
+    getMcpStartupMetrics: async () => {
+      const mcpScope: ScopeRef = { sessionId, agentId: 'main' };
+      await call(mcpScope, 'agentMcpService', 'waitForInitialLoad', []);
+      const durationMs = (await call(mcpScope, 'agentMcpService', 'initialLoadDurationMs', [])) as
+        number;
+      return { durationMs };
+    },
+    addAdditionalDir: async (path, options) => {
+      const workspaceId = await resolveWorkspaceId();
+      if (workspaceId === undefined) {
+        throw new RPCError(NOT_FOUND, `session not found: ${sessionId}`);
+      }
+      return call({ workspaceId }, 'workspaceDirs', 'addDir', [
+        { path, persist: options?.persist },
+      ]) as Promise<AddAdditionalDirResult>;
+    },
 
     approvals: {
       list: () =>

@@ -19,6 +19,8 @@ import { getLiveSessionById } from '@moonshot-ai/agent-core-v2/app/workspaceLife
 import { IAgentLifecycleService } from '@moonshot-ai/agent-core-v2/session/agentLifecycle/agentLifecycle';
 import { ensureMainAgent } from '@moonshot-ai/agent-core-v2/session/agentLifecycle/mainAgent';
 import { ISessionInteractionService } from '@moonshot-ai/agent-core-v2/session/interaction/interaction';
+import type { ISessionSkillCatalog } from '@moonshot-ai/agent-core-v2/session/sessionSkillCatalog/skillCatalog';
+import { summarizeSkill } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 import { IEventBus } from '@moonshot-ai/agent-core-v2/app/event/eventBus';
 
 import type { EventSourceRef, IDisposable, ScopeRef } from '../../core/channel.js';
@@ -152,6 +154,15 @@ export function createMemoryDispatcher(root: ScopeLike): MemoryDispatcher {
   return {
     async call(scope, service, method, args) {
       const resolved = await resolveScope(scope);
+      // Facade-synthesized: the catalog is a property of the service (not a
+      // wire-able method), so `listSkills` awaits readiness and projects
+      // through `summarizeSkill` here — the same composition kap-server's
+      // `/skills` routes perform at the edge.
+      if (service === 'sessionSkillCatalog' && method === 'listSkills') {
+        const catalog = resolveService(resolved, service) as unknown as ISessionSkillCatalog;
+        await catalog.ready;
+        return wireClone(catalog.catalog.listSkills().map(summarizeSkill));
+      }
       const instance = resolveService(resolved, service);
       const member = instance[method];
       if (member === undefined) {

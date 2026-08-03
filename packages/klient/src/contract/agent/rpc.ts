@@ -189,6 +189,27 @@ export const getTaskOutputPayloadSchema = z.object({
   tail: z.number().optional(),
 });
 
+export const activateSkillPayloadSchema = z.object({
+  name: z.string(),
+  args: z.string().optional(),
+});
+
+export const undoHistoryPayloadSchema = z.object({
+  count: z.number(),
+});
+
+/**
+ * The `getTools` wire row — the engine's RPC maps each registered tool to
+ * `{ name, description, active, source }` (`active` is resolved live from the
+ * tool policy; it is not part of the declared `ToolInfo` type).
+ */
+export const toolInfoSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  active: z.boolean(),
+  source: z.enum(['builtin', 'user', 'mcp']),
+});
+
 // ── contract ────────────────────────────────────────────────────────────────
 
 export const agentRpcContract = {
@@ -197,4 +218,8 @@ export const agentRpcContract = {
   cancel: { input: z.tuple([cancelPayloadSchema]), output: noResult },
   setPermission: { input: z.tuple([setPermissionPayloadSchema]), output: noResult },
   getContext: { input: z.tuple([emptyPayloadSchema]), output: agentContextDataSchema },
+  undoHistory: { input: z.tuple([undoHistoryPayloadSchema]), output: z.number() },
+  cancelCompaction: { input: z.tuple([emptyPayloadSchema]), output: noResult },
+  activateSkill: { input: z.tuple([activateSkillPayloadSchema]), output: noResult },
+  getTools: { input: z.tuple([emptyPayloadSchema]), output: z.array(toolInfoSchema) },
 } satisfies ServiceContract;

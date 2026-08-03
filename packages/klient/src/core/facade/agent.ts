@@ -8,12 +8,16 @@
  */
 
 import type { IAgentRPCService } from '@moonshot-ai/agent-core-v2/agent/rpc/rpc';
+import type { IAgentGoalService } from '@moonshot-ai/agent-core-v2/agent/goal/goal';
 import type { IAgentPlanService } from '@moonshot-ai/agent-core-v2/agent/plan/plan';
 import type { IAgentProfileService } from '@moonshot-ai/agent-core-v2/agent/profile/profile';
 import type { IAgentShellCommandService } from '@moonshot-ai/agent-core-v2/agent/shellCommand/shellCommand';
+import type { IAgentSwarmService, SwarmModeTrigger } from '@moonshot-ai/agent-core-v2/agent/swarm/swarm';
 import type { IAgentTaskService } from '@moonshot-ai/agent-core-v2/agent/task/task';
 import type { IAgentUsageService } from '@moonshot-ai/agent-core-v2/agent/usage/usage';
+import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 import type { ContentPart } from '@moonshot-ai/agent-core-v2/kosong/contract/message';
+import type { ThinkingEffort } from '@moonshot-ai/agent-core-v2/kosong/contract/provider';
 import type { PermissionMode } from '@moonshot-ai/agent-core-v2/agent/permissionPolicy/types';
 
 import type { ScopeRef } from '../channel.js';
@@ -28,6 +32,15 @@ export type UsageStatus = Awaited<ReturnType<IAgentUsageService['status']>>;
 export type AgentContextData = Awaited<ReturnType<IAgentRPCService['getContext']>>;
 export type PlanData = Awaited<ReturnType<IAgentPlanService['status']>>;
 export type AgentTaskInfo = Awaited<ReturnType<IAgentTaskService['list']>>[number];
+export type CreateGoalInput = Parameters<IAgentGoalService['createGoal']>[0];
+export type GoalSnapshot = Awaited<ReturnType<IAgentGoalService['createGoal']>>;
+export type GoalToolResult = ReturnType<IAgentGoalService['getGoal']>;
+export type AgentToolInfo = Awaited<ReturnType<IAgentRPCService['getTools']>>[number] & {
+  /** Resolved live from the tool policy at call time; the engine's declared
+   * `ToolInfo` type omits it, but every wire row carries it. */
+  readonly active: boolean;
+};
+export type { SkillSummary, SwarmModeTrigger };
 
 export interface AgentFacade {
   prompt(input: {
@@ -50,6 +63,27 @@ export interface AgentFacade {
   getTasks(input?: { activeOnly?: boolean; limit?: number }): Promise<readonly AgentTaskInfo[]>;
   stopTask(input: { taskId: string; reason?: string }): Promise<void>;
   getTaskOutput(input: { taskId: string; tail?: number }): Promise<string>;
+  // --- Goal lifecycle (mirrors the v1 SDK session methods) ----------------
+  createGoal(input: CreateGoalInput): Promise<GoalSnapshot>;
+  getGoal(): Promise<GoalToolResult>;
+  pauseGoal(): Promise<GoalSnapshot>;
+  resumeGoal(): Promise<GoalSnapshot>;
+  cancelGoal(): Promise<GoalSnapshot>;
+  // --- Skills --------------------------------------------------------------
+  listSkills(): Promise<readonly SkillSummary[]>;
+  activateSkill(name: string, args?: string): Promise<void>;
+  // --- Swarm ---------------------------------------------------------------
+  setSwarmMode(enabled: boolean, trigger: SwarmModeTrigger): Promise<void>;
+  // --- Compaction ----------------------------------------------------------
+  compact(input?: { instruction?: string }): Promise<void>;
+  cancelCompaction(): Promise<void>;
+  // --- Tools / thinking ------------------------------------------------------
+  setThinking(effort: ThinkingEffort): Promise<void>;
+  getTools(): Promise<readonly AgentToolInfo[]>;
+  setActiveTools(tools: readonly string[]): Promise<void>;
+  // --- History / tasks -------------------------------------------------------
+  undoHistory(count?: number): Promise<number>;
+  detachBackgroundTask(taskId: string): Promise<AgentTaskInfo | undefined>;
 }
 
 export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFacade {
@@ -89,5 +123,46 @@ export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFac
     },
     getTaskOutput: (input) =>
       call(scope, 'agentTaskService', 'readOutput', [input.taskId, input.tail]) as Promise<string>,
+    createGoal: (input) =>
+      call(scope, 'agentGoalService', 'createGoal', [input]) as Promise<GoalSnapshot>,
+    getGoal: () => call(scope, 'agentGoalService', 'getGoal', []) as Promise<GoalToolResult>,
+    pauseGoal: () =>
+      call(scope, 'agentGoalService', 'pauseGoal', [undefined]) as Promise<GoalSnapshot>,
+    resumeGoal: () =>
+      call(scope, 'agentGoalService', 'resumeGoal', [undefined]) as Promise<GoalSnapshot>,
+    cancelGoal: () =>
+      call(scope, 'agentGoalService', 'cancelGoal', [undefined]) as Promise<GoalSnapshot>,
+    // `listSkills` is dispatcher-synthesized from the session-scope catalog
+    // (see dispatcher.ts); the agent scope resolves the parent-scope service.
+    listSkills: () =>
+      call(scope, 'sessionSkillCatalog', 'listSkills', []) as Promise<readonly SkillSummary[]>,
+    // Fire-and-forget like the v1 RPC: the skill turn launches in the
+    // background and also updates the session prompt metadata.
+    activateSkill: (name, args) => rpc('activateSkill', { name, args }) as Promise<void>,
+    setSwarmMode: async (enabled, trigger) => {
+      if (enabled) {
+        await call(scope, 'agentSwarmService', 'enter', [trigger]);
+        return;
+      }
+      await call(scope, 'agentSwarmService', 'exit', []);
+    },
+    // `begin` reports whether the compaction started (`false` = one is
+    // already running); the v1 SDK surface is `void`, so the flag is dropped.
+    compact: async (input) => {
+      await call(scope, 'agentFullCompactionService', 'begin', [
+        { source: 'manual', instruction: input?.instruction },
+      ]);
+    },
+    cancelCompaction: () => rpc('cancelCompaction', {}) as Promise<void>,
+    setThinking: (effort) =>
+      call(scope, 'agentProfileService', 'setThinking', [effort]) as Promise<void>,
+    getTools: () => rpc('getTools', {}) as Promise<readonly AgentToolInfo[]>,
+    setActiveTools: (tools) =>
+      call(scope, 'agentProfileService', 'update', [
+        { activeToolNames: [...tools] },
+      ]) as Promise<void>,
+    undoHistory: (count) => rpc('undoHistory', { count: count ?? 1 }) as Promise<number>,
+    detachBackgroundTask: (taskId) =>
+      call(scope, 'agentTaskService', 'detach', [taskId]) as Promise<AgentTaskInfo | undefined>,
   };
 }

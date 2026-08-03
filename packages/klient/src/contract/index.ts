@@ -8,11 +8,15 @@
 
 import type { KlientContract } from './types.js';
 import { agentActivityViewContract } from './agent/activity.js';
+import { agentGoalContract } from './agent/goal.js';
+import { agentMcpContract } from './agent/mcp.js';
 import { agentRpcContract } from './agent/rpc.js';
 import {
+  agentFullCompactionContract,
   agentPlanContract,
   agentProfileContract,
   agentShellCommandContract,
+  agentSwarmContract,
   agentTaskContract,
   agentUsageContract,
 } from './agent/services.js';
@@ -29,6 +33,7 @@ import { providersContract } from './global/providers.js';
 import { sessionsContract } from './global/sessions.js';
 import { workspacesContract } from './global/workspaces.js';
 import { sessionApprovalContract } from './session/approval.js';
+import { sessionBtwContract } from './session/btw.js';
 import { sessionInteractionContract } from './session/interaction.js';
 import {
   sessionLifecycleContract,
@@ -36,6 +41,9 @@ import {
 } from './session/lifecycle.js';
 import { sessionMetadataContract } from './session/metadata.js';
 import { sessionQuestionContract } from './session/question.js';
+import { sessionSecondaryModelWarningContract } from './session/secondaryModelWarning.js';
+import { sessionSkillCatalogContract } from './session/skillCatalog.js';
+import { workspaceDirsContract } from './session/workspaceDirs.js';
 
 export const globalContract: KlientContract = {
   // core (app scope)
@@ -55,16 +63,24 @@ export const globalContract: KlientContract = {
   // workspace scope (+ the app-registered handler registry)
   workspaceLifecycleService: workspaceLifecycleContract,
   sessionLifecycleService: sessionLifecycleContract,
+  workspaceDirs: workspaceDirsContract,
   // session scope
   sessionMetadata: sessionMetadataContract,
   sessionInteractionService: sessionInteractionContract,
   sessionApprovalService: sessionApprovalContract,
   sessionQuestionService: sessionQuestionContract,
+  sessionSkillCatalog: sessionSkillCatalogContract,
+  sessionBtwService: sessionBtwContract,
+  sessionSecondaryModelWarningService: sessionSecondaryModelWarningContract,
   // agent scope
   agentRPCService: agentRpcContract,
   agentActivityView: agentActivityViewContract,
+  agentFullCompactionService: agentFullCompactionContract,
+  agentGoalService: agentGoalContract,
+  agentMcpService: agentMcpContract,
   agentShellCommandService: agentShellCommandContract,
   agentProfileService: agentProfileContract,
+  agentSwarmService: agentSwarmContract,
   agentUsageService: agentUsageContract,
   agentPlanService: agentPlanContract,
   agentTaskService: agentTaskContract,

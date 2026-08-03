@@ -30,11 +30,19 @@ import { ISessionApprovalService } from '@moonshot-ai/agent-core-v2/session/appr
 import { ISessionQuestionService } from '@moonshot-ai/agent-core-v2/session/question/question';
 import { IAgentRPCService } from '@moonshot-ai/agent-core-v2/agent/rpc/rpc';
 import { IAgentActivityView } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
+import { IAgentFullCompactionService } from '@moonshot-ai/agent-core-v2/agent/fullCompaction/fullCompaction';
+import { IAgentGoalService } from '@moonshot-ai/agent-core-v2/agent/goal/goal';
 import { IAgentPlanService } from '@moonshot-ai/agent-core-v2/agent/plan/plan';
 import { IAgentProfileService } from '@moonshot-ai/agent-core-v2/agent/profile/profile';
 import { IAgentShellCommandService } from '@moonshot-ai/agent-core-v2/agent/shellCommand/shellCommand';
+import { IAgentSwarmService } from '@moonshot-ai/agent-core-v2/agent/swarm/swarm';
 import { IAgentTaskService } from '@moonshot-ai/agent-core-v2/agent/task/task';
 import { IAgentUsageService } from '@moonshot-ai/agent-core-v2/agent/usage/usage';
+import { ISessionSkillCatalog } from '@moonshot-ai/agent-core-v2/session/sessionSkillCatalog/skillCatalog';
+import { ISessionBtwService } from '@moonshot-ai/agent-core-v2/session/btw/btw';
+import { ISessionSecondaryModelWarningService } from '@moonshot-ai/agent-core-v2/session/subagent/secondaryModelWarning';
+import { IAgentMcpService } from '@moonshot-ai/agent-core-v2/agent/mcp/mcp';
+import { IWorkspaceDirs } from '@moonshot-ai/agent-core-v2/workspace/workspaceDirs/workspaceDirs';
 
 /** Wire service name (decorator id string) → token. */
 export const serviceTokens: Readonly<Record<string, ServiceIdentifier<unknown>>> = {
@@ -57,10 +65,18 @@ export const serviceTokens: Readonly<Record<string, ServiceIdentifier<unknown>>>
   sessionInteractionService: ISessionInteractionService,
   sessionApprovalService: ISessionApprovalService,
   sessionQuestionService: ISessionQuestionService,
+  sessionSkillCatalog: ISessionSkillCatalog,
+  sessionBtwService: ISessionBtwService,
+  sessionSecondaryModelWarningService: ISessionSecondaryModelWarningService,
+  agentMcpService: IAgentMcpService,
+  workspaceDirs: IWorkspaceDirs,
   agentRPCService: IAgentRPCService,
   agentActivityView: IAgentActivityView,
+  agentFullCompactionService: IAgentFullCompactionService,
+  agentGoalService: IAgentGoalService,
   agentShellCommandService: IAgentShellCommandService,
   agentProfileService: IAgentProfileService,
+  agentSwarmService: IAgentSwarmService,
   agentUsageService: IAgentUsageService,
   agentPlanService: IAgentPlanService,
   agentTaskService: IAgentTaskService,

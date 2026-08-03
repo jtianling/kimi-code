@@ -57,20 +57,30 @@ export type {
 } from './core/facade/kosong-types.js';
 
 export type {
+  AddAdditionalDirResult,
+  McpServerInfo,
+  McpStartupMetrics,
   SessionApprovalsFacade,
   SessionFacade,
   SessionInteractionsFacade,
   SessionQuestionsFacade,
   SessionStatus,
+  SessionWarning,
 } from './core/facade/session.js';
 export type {
   AgentContextData,
   AgentFacade,
   AgentTaskInfo,
+  AgentToolInfo,
+  CreateGoalInput,
+  GoalSnapshot,
+  GoalToolResult,
   PlanData,
   PromptLaunchResult,
   SetModelResult,
   ShellCommandResult,
+  SkillSummary,
+  SwarmModeTrigger,
   UsageStatus,
 } from './core/facade/agent.js';
 
@@ -131,4 +141,5 @@ export type {
   InteractionKind,
 } from '@moonshot-ai/agent-core-v2/session/interaction/interaction';
 export type { ContentPart } from '@moonshot-ai/agent-core-v2/kosong/contract/message';
+export type { ThinkingEffort } from '@moonshot-ai/agent-core-v2/kosong/contract/provider';
 export type { PermissionMode } from '@moonshot-ai/agent-core-v2/agent/permissionPolicy/types';

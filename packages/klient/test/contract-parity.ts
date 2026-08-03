@@ -22,10 +22,24 @@ import type {
   TurnPhase,
 } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
 import type { AgentContextData } from '@moonshot-ai/agent-core-v2/agent/contextMemory/types';
+import type { FullCompactionInput } from '@moonshot-ai/agent-core-v2/agent/fullCompaction/fullCompaction';
+import type { ProfileUpdateData } from '@moonshot-ai/agent-core-v2/agent/profile/profile';
+import type {
+  GoalReasonInput,
+  ResumeGoalInput,
+} from '@moonshot-ai/agent-core-v2/agent/goal/goal';
+import type {
+  CreateGoalInput,
+  GoalBudgetReport,
+  GoalSnapshot,
+  GoalToolResult,
+} from '@moonshot-ai/agent-core-v2/agent/goal/types';
+import type { SwarmModeTrigger } from '@moonshot-ai/agent-core-v2/agent/swarm/swarm';
 import type { TurnEndReason } from '@moonshot-ai/agent-core-v2/agent/loop/turnEvents';
 import type { PlanData } from '@moonshot-ai/agent-core-v2/agent/plan/plan';
 import type {
   AgentAPI,
+  ActivateSkillPayload,
   CancelPlanPayload,
   CancelShellCommandPayload,
   EmptyPayload,
@@ -37,7 +51,15 @@ import type {
   SetModelResult,
   ShellCommandResult,
   StopTaskPayload,
+  UndoHistoryPayload,
 } from '@moonshot-ai/agent-core-v2/agent/rpc/core-api';
+import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
+import type { McpServerEntry } from '@moonshot-ai/agent-core-v2/mcpCore/connection-manager';
+import type { SecondaryModelWarning } from '@moonshot-ai/agent-core-v2/session/subagent/secondaryModelWarning';
+import type {
+  WorkspaceAddDirInput,
+  WorkspaceAdditionalDirsResult,
+} from '@moonshot-ai/agent-core-v2/workspace/workspaceDirs/workspaceDirs';
 import type { UsageStatus } from '@moonshot-ai/agent-core-v2/agent/usage/usage';
 import type { ISessionScopeHandle } from '@moonshot-ai/agent-core-v2/_base/di/scope';
 import type {
@@ -142,6 +164,7 @@ import {
 import {
   agentContextDataSchema,
   agentTaskInfoSchema,
+  activateSkillPayloadSchema,
   cancelPayloadSchema,
   cancelPlanPayloadSchema,
   cancelShellCommandPayloadSchema,
@@ -160,8 +183,30 @@ import {
   steerPayloadSchema,
   stopTaskPayloadSchema,
   tokenUsageSchema,
+  toolInfoSchema,
+  undoHistoryPayloadSchema,
   usageStatusSchema,
 } from '../src/contract/agent/rpc.js';
+import {
+  fullCompactionInputSchema,
+  profileUpdateDataSchema,
+  swarmModeTriggerSchema,
+} from '../src/contract/agent/services.js';
+import { skillSummarySchema } from '../src/contract/session/skillCatalog.js';
+import { mcpServerEntrySchema } from '../src/contract/agent/mcp.js';
+import { secondaryModelWarningSchema } from '../src/contract/session/secondaryModelWarning.js';
+import {
+  workspaceAddDirInputSchema,
+  workspaceAdditionalDirsResultSchema,
+} from '../src/contract/session/workspaceDirs.js';
+import {
+  createGoalInputSchema,
+  goalBudgetReportSchema,
+  goalReasonInputSchema,
+  goalSnapshotSchema,
+  goalToolResultSchema,
+  resumeGoalInputSchema,
+} from '../src/contract/agent/goal.js';
 import {
   assistantDeltaEventSchema,
   promptAbortedEventSchema,
@@ -522,6 +567,43 @@ const _agentTaskInfo: AssertWire<typeof agentTaskInfoSchema, TaskInfo> = true;
 const _stopTaskPayload: AssertWire<typeof stopTaskPayloadSchema, StopTaskPayload> = true;
 const _getTaskOutputPayload: AssertWire<typeof getTaskOutputPayloadSchema, GetTaskOutputPayload> =
   true;
+
+// ── agent scope (goal.ts) ───────────────────────────────────────────────────
+const _goalBudgetReport: AssertWire<typeof goalBudgetReportSchema, GoalBudgetReport> = true;
+const _goalSnapshot: AssertWire<typeof goalSnapshotSchema, GoalSnapshot> = true;
+const _goalToolResult: AssertWire<typeof goalToolResultSchema, GoalToolResult> = true;
+const _createGoalInput: AssertWire<typeof createGoalInputSchema, CreateGoalInput> = true;
+const _goalReasonInput: AssertWire<typeof goalReasonInputSchema, GoalReasonInput> = true;
+const _resumeGoalInput: AssertWire<typeof resumeGoalInputSchema, ResumeGoalInput> = true;
+
+// ── agent scope (services.ts — swarm) / session scope (skillCatalog.ts) ─────
+const _swarmModeTrigger: AssertWire<typeof swarmModeTriggerSchema, SwarmModeTrigger> = true;
+const _skillSummary: AssertWire<typeof skillSummarySchema, SkillSummary> = true;
+const _activateSkillPayload: AssertWire<typeof activateSkillPayloadSchema, ActivateSkillPayload> =
+  true;
+
+// ── session/workspace scope (btw / warnings / mcp / workspaceDirs) ──────────
+const _secondaryModelWarning: AssertWire<
+  typeof secondaryModelWarningSchema,
+  SecondaryModelWarning
+> = true;
+const _mcpServerEntry: AssertWire<typeof mcpServerEntrySchema, McpServerEntry> = true;
+const _workspaceAddDirInput: AssertWire<typeof workspaceAddDirInputSchema, WorkspaceAddDirInput> =
+  true;
+const _workspaceAdditionalDirsResult: AssertWire<
+  typeof workspaceAdditionalDirsResultSchema,
+  WorkspaceAdditionalDirsResult
+> = true;
+
+// ── agent scope (compaction / profile / undo / tools) ───────────────────────
+const _fullCompactionInput: AssertWire<typeof fullCompactionInputSchema, FullCompactionInput> =
+  true;
+const _profileUpdateData: AssertWire<typeof profileUpdateDataSchema, ProfileUpdateData> = true;
+const _undoHistoryPayload: AssertWire<typeof undoHistoryPayloadSchema, UndoHistoryPayload> = true;
+// One-directional (wire → engine): the wire row carries the live-resolved
+// `active` flag, which the declared `ToolInfo` type does not include.
+type GetToolsRow = Awaited<ReturnType<AgentAPI['getTools']>>[number];
+const _toolInfo: AssertWireToEngine<typeof toolInfoSchema, GetToolsRow> = true;
 
 // ── agent scope (events.ts) ─────────────────────────────────────────────────
 // Parity against the protocol event types (the stream carries flat

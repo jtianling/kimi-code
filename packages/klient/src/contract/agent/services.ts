@@ -26,9 +26,28 @@ export const agentShellCommandContract = {
   cancel: { input: z.tuple([z.string()]), output: noResult },
 } satisfies ServiceContract;
 
+/**
+ * `ProfileUpdateData` (`agent-core-v2/agent/profile/profile.ts`) — the facade
+ * only ever sends the `activeToolNames` slice (whole-set tool replace); the
+ * schema mirrors the full update payload so other slices stay wire-legal.
+ */
+export const profileUpdateDataSchema = z.object({
+  modelAlias: z.string().optional(),
+  profileName: z.string().optional(),
+  thinkingLevel: z.string().optional(),
+  systemPrompt: z.string().optional(),
+  disallowedTools: z.array(z.string()).optional(),
+  activeToolNames: z.array(z.string()).optional(),
+});
+
 export const agentProfileContract = {
   getModel: { input: z.tuple([]), output: z.string() },
   setModel: { input: z.tuple([z.string()]), output: setModelResultSchema },
+  setThinking: { input: z.tuple([z.string()]), output: noResult },
+  update: { input: z.tuple([profileUpdateDataSchema]), output: noResult },
+  // The cached oversized-AGENTS.md notice (computed on every profile bind);
+  // the session facade folds it into `getSessionWarnings`.
+  getAgentsMdWarning: { input: z.tuple([]), output: maybe(z.string()) },
 } satisfies ServiceContract;
 
 export const agentUsageContract = {
@@ -56,4 +75,29 @@ export const agentTaskContract = {
     input: z.tuple([z.string(), z.number().optional()]),
     output: z.string(),
   },
+  detach: { input: z.tuple([z.string()]), output: maybe(agentTaskInfoSchema) },
+} satisfies ServiceContract;
+
+/** `SwarmModeTrigger` (`agent-core-v2/agent/swarm/swarm.ts`). */
+export const swarmModeTriggerSchema = z.enum(['manual', 'task', 'tool']);
+
+export const agentSwarmContract = {
+  enter: { input: z.tuple([swarmModeTriggerSchema]), output: noResult },
+  exit: { input: z.tuple([]), output: noResult },
+} satisfies ServiceContract;
+
+/**
+ * `FullCompactionInput` (`agent-core-v2/agent/fullCompaction/fullCompaction.ts`).
+ * `begin` returns whether the compaction actually started (`false` when one is
+ * already running); cancellation is not a method on this service — the engine
+ * cancels through the in-flight task's `AbortController`, exposed on the wire
+ * as `agentRPCService.cancelCompaction`.
+ */
+export const fullCompactionInputSchema = z.object({
+  source: z.enum(['manual', 'auto']),
+  instruction: z.string().optional(),
+});
+
+export const agentFullCompactionContract = {
+  begin: { input: z.tuple([fullCompactionInputSchema]), output: z.boolean() },
 } satisfies ServiceContract;

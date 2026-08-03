@@ -127,6 +127,135 @@ describe('facade routing', () => {
   });
 });
 
+describe('agent facade routing', () => {
+  it('maps the milestone-3 agent methods to their wire triples', async () => {
+    const channel = new FakeChannel();
+    const klient = createKlientFromChannel(channel, { validate: false });
+    const agent = klient.session('s1').agent('main');
+    const called = () => channel.calls.map((c) => `${c.service}.${c.method}`);
+
+    await agent.createGoal({ objective: 'ship it' });
+    await agent.getGoal();
+    await agent.pauseGoal();
+    await agent.resumeGoal();
+    await agent.cancelGoal();
+    await agent.listSkills();
+    await agent.activateSkill('write-tui', 'arg');
+    await agent.setSwarmMode(true, 'manual');
+    await agent.setSwarmMode(false, 'manual');
+    await agent.compact({ instruction: 'keep it short' });
+    await agent.cancelCompaction();
+    await agent.setThinking('on');
+    await agent.getTools();
+    await agent.setActiveTools(['Read']);
+    await agent.undoHistory();
+    await agent.detachBackgroundTask('t1');
+
+    expect(called()).toEqual([
+      'agentGoalService.createGoal',
+      'agentGoalService.getGoal',
+      'agentGoalService.pauseGoal',
+      'agentGoalService.resumeGoal',
+      'agentGoalService.cancelGoal',
+      'sessionSkillCatalog.listSkills',
+      'agentRPCService.activateSkill',
+      'agentSwarmService.enter',
+      'agentSwarmService.exit',
+      'agentFullCompactionService.begin',
+      'agentRPCService.cancelCompaction',
+      'agentProfileService.setThinking',
+      'agentRPCService.getTools',
+      'agentProfileService.update',
+      'agentRPCService.undoHistory',
+      'agentTaskService.detach',
+    ]);
+    expect(channel.calls[0]?.args).toEqual([{ objective: 'ship it' }]);
+    expect(channel.calls[2]?.args).toEqual([undefined]);
+    expect(channel.calls[6]?.args).toEqual([{ name: 'write-tui', args: 'arg' }]);
+    expect(channel.calls[7]?.args).toEqual(['manual']);
+    expect(channel.calls[9]?.args).toEqual([{ source: 'manual', instruction: 'keep it short' }]);
+    expect(channel.calls[11]?.args).toEqual(['on']);
+    expect(channel.calls[13]?.args).toEqual([{ activeToolNames: ['Read'] }]);
+    expect(channel.calls[14]?.args).toEqual([{ count: 1 }]);
+    expect(channel.calls[15]?.args).toEqual(['t1']);
+  });
+});
+
+describe('session facade routing', () => {
+  it('maps the milestone-3 session methods to their wire triples', async () => {
+    const channel = new FakeChannel();
+    const klient = createKlientFromChannel(channel, { validate: false });
+    const session = klient.session('s1');
+    const called = () => channel.calls.map((c) => `${c.service}.${c.method}`);
+
+    channel.result = 'btw-agent-1';
+    await session.startBtw();
+    channel.result = undefined; // both warning getters return undefined
+    await session.getSessionWarnings();
+    channel.result = [];
+    await session.listMcpServers();
+    channel.result = 0; // waitForInitialLoad (void) and initialLoadDurationMs
+    await session.getMcpStartupMetrics();
+    // addAdditionalDir resolves the workspace through the session index first.
+    channel.results.set('sessionIndex.get', { id: 's1', workspaceId: 'w1' });
+    channel.result = {
+      projectRoot: '/x',
+      configPath: '/x/.kimi-code/local.toml',
+      additionalDirs: ['/extra'],
+      persisted: false,
+    };
+    await session.addAdditionalDir('/extra', { persist: false });
+
+    expect(called()).toEqual([
+      'agentProfileService.getModel', // startBtw's main-agent materialization poke
+      'sessionBtwService.start',
+      'agentProfileService.getAgentsMdWarning',
+      'sessionSecondaryModelWarningService.getSecondaryModelWarning',
+      'agentMcpService.list',
+      'agentMcpService.waitForInitialLoad',
+      'agentMcpService.initialLoadDurationMs',
+      'sessionIndex.get',
+      'workspaceDirs.addDir',
+    ]);
+    // Session-scope call for btw; main-agent scope for warnings/MCP;
+    // workspace scope for addDir.
+    expect(channel.calls[0]?.scope).toEqual({ sessionId: 's1', agentId: 'main' });
+    expect(channel.calls[1]?.scope).toEqual({ sessionId: 's1' });
+    expect(channel.calls[2]?.scope).toEqual({ sessionId: 's1', agentId: 'main' });
+    expect(channel.calls[3]?.scope).toEqual({ sessionId: 's1' });
+    expect(channel.calls[4]?.scope).toEqual({ sessionId: 's1', agentId: 'main' });
+    expect(channel.calls[7]?.scope).toEqual({});
+    expect(channel.calls[8]?.scope).toEqual({ workspaceId: 'w1' });
+    expect(channel.calls[8]?.args).toEqual([{ path: '/extra', persist: false }]);
+  });
+
+  it('composes getSessionWarnings from the two warning sources', async () => {
+    const channel = new FakeChannel();
+    const klient = createKlientFromChannel(channel, { validate: false });
+    const session = klient.session('s1');
+
+    channel.results.set('agentProfileService.getAgentsMdWarning', 'AGENTS.md too big');
+    channel.results.set('sessionSecondaryModelWarningService.getSecondaryModelWarning', {
+      code: 'secondary-model-invalid',
+      message: 'no such model',
+    });
+    await expect(session.getSessionWarnings()).resolves.toEqual([
+      { code: 'agents-md-oversized', message: 'AGENTS.md too big', severity: 'warning' },
+      { code: 'secondary-model-invalid', message: 'no such model', severity: 'warning' },
+    ]);
+  });
+
+  it('fails addAdditionalDir when the session is unknown', async () => {
+    const channel = new FakeChannel();
+    const klient = createKlientFromChannel(channel, { validate: false });
+    channel.results.set('sessionIndex.get', undefined);
+    await expect(klient.session('gone').addAdditionalDir('/extra')).rejects.toMatchObject({
+      name: 'RPCError',
+      code: 40404,
+    });
+  });
+});
+
 describe('contract validation', () => {
   it('rejects invalid input before the call leaves the client', async () => {
     const channel = new FakeChannel();
