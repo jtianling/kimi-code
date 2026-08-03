@@ -5,7 +5,9 @@ export { KimiAuthFacade } from '#/auth';
 export { createKimiHarness, SDKRpcClient, type SDKRpcClientOptions } from '#/sdk-rpc-client';
 export {
   createKimiHarnessV2,
+  createKimiHarnessV2Remote,
   SDKRpcClientV2,
+  type KimiHarnessV2RemoteConnection,
   type SDKRpcClientV2Options,
 } from '#/sdk-rpc-client-v2';
 export {

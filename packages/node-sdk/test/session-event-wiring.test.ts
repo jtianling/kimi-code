@@ -1,123 +1,181 @@
 /**
- * `SessionEventWiring` — the in-process v1 edge over the v2 per-agent event
- * bus. Covers the status-snapshot fold: v2 emits `agent.status.updated` in
- * slices and the model slice rides only the bind-time emission, so the
- * wiring merges a consistent usage + context + model snapshot into every
- * status event (mirrors kap-server's broadcaster bridge), including the
- * secondary-model derived id resolution.
+ * `SessionEventWiring` — the facade-driven v1 edge over the v2 event stream
+ * and interaction kernel. Covers the status-snapshot fold (usage + context +
+ * model merged into every `agent.status.updated`, per-agent order preserved
+ * under async enrichment) and the approval/question/user-tool bridge
+ * (pending interactions fed to the sink, outcomes written back through the
+ * typed facades).
  * Run: pnpm exec vitest run test/session-event-wiring.test.ts
  */
 import { describe, expect, it } from 'vitest';
 
-import type { Event } from '@moonshot-ai/agent-core';
-import {
-  ContextSizeModel,
-  IAgentContextSizeService,
-  IAgentLifecycleService,
-  IAgentProfileService,
-  IAgentUsageService,
-  IEventBus,
-  IModelCatalog,
-  ISessionInteractionService,
-  IWireService,
-  SECONDARY_DERIVED_MODEL_ID,
-  type IAgentScopeHandle,
-  type ISessionScopeHandle,
-} from '@moonshot-ai/agent-core-v2';
+import type {
+  ApprovalRequest,
+  ApprovalResponse,
+  Event,
+  QuestionResult,
+} from '@moonshot-ai/agent-core';
+import type { Interaction } from '@moonshot-ai/agent-core-v2';
+import type { AgentHandle, SessionHandle } from '@moonshot-ai/klient';
 
 import { SessionEventWiring, type SessionEventSink } from '#/v2/session-wiring';
 
 // ---------------------------------------------------------------------------
-// Fakes
+// Fakes (structural — the wiring only touches these members)
 // ---------------------------------------------------------------------------
 
 type FakeBusEvent = { type: string } & Record<string, unknown>;
+type Listener = (payload: never) => void;
 
-class FakeAgentBus {
-  private handlers: Array<(e: FakeBusEvent) => void> = [];
-  subscribe(handler: (e: FakeBusEvent) => void): { dispose(): void } {
-    this.handlers.push(handler);
+class FakeEventHub {
+  private readonly handlers = new Map<string, Set<Listener>>();
+
+  on(event: string, listener: Listener): { dispose(): void } {
+    let set = this.handlers.get(event);
+    if (set === undefined) {
+      set = new Set();
+      this.handlers.set(event, set);
+    }
+    set.add(listener);
     return {
       dispose: () => {
-        const i = this.handlers.indexOf(handler);
-        if (i >= 0) this.handlers.splice(i, 1);
+        set.delete(listener);
       },
     };
   }
-  emit(e: FakeBusEvent): void {
-    for (const h of [...this.handlers]) h(e);
+
+  emit(event: string, payload: unknown): void {
+    for (const listener of [...(this.handlers.get(event) ?? [])]) {
+      (listener as (p: unknown) => void)(payload);
+    }
   }
 }
 
-class FakeAgentHandle {
-  readonly kind = 2;
-  readonly bus = new FakeAgentBus();
-  readonly accessor;
-  private readonly services = new Map<unknown, unknown>();
-  constructor(readonly id: string) {
-    this.services.set(IEventBus, this.bus);
-    this.accessor = {
-      get: (token: unknown) => this.services.get(token),
-    };
-  }
-  set(token: unknown, service: unknown): void {
-    this.services.set(token, service);
-  }
-  dispose(): void {}
-}
-
-function makeSession(agents: FakeAgentHandle[]): ISessionScopeHandle {
-  const lifecycle = {
-    list: () => agents,
-    onDidCreate: () => ({ dispose: () => {} }),
-    onDidDispose: () => ({ dispose: () => {} }),
-  };
-  const interactions = {
-    onDidChangePending: () => ({ dispose: () => {} }),
-    listPending: () => [],
-  };
-  const accessor = {
-    get: (token: unknown): unknown => {
-      if (token === IAgentLifecycleService) return lifecycle;
-      if (token === ISessionInteractionService) return interactions;
-      return undefined;
-    },
-  };
-  return { id: 's1', kind: 1, accessor, dispose: () => {} } as unknown as ISessionScopeHandle;
-}
-
-function collectingSink(): { sink: SessionEventSink; events: Event[] } {
-  const events: Event[] = [];
-  return {
-    events,
-    sink: {
-      receiveEvent: (event) => {
-        events.push(event);
-      },
-      requestApproval: () => Promise.resolve('cancelled' as never),
-      requestQuestion: () => Promise.resolve(null),
-      toolCall: () => Promise.resolve({ output: 'not supported', isError: true }),
-    },
-  };
+interface FakeAgentOptions {
+  readonly model?: string;
+  readonly incomplete?: boolean;
 }
 
 const USAGE = {
   total: { inputOther: 1, output: 2, inputCacheRead: 0, inputCacheCreation: 0 },
 };
 
-function bindStatusServices(agent: FakeAgentHandle, model: string): void {
-  agent.set(IAgentContextSizeService, { get: () => ({ size: 10 }) });
-  agent.set(IAgentProfileService, {
-    getModel: () => model,
-    getModelCapabilities: () => ({ max_context_tokens: 128_000 }),
-  });
-  agent.set(IAgentUsageService, { status: () => USAGE });
-  agent.set(IWireService, {
-    getModel: (requested: unknown) => {
-      expect(requested).toBe(ContextSizeModel);
-      return { length: 0, tokens: 8 };
+function makeAgent(id: string, options: FakeAgentOptions = {}): AgentHandle {
+  const events = new FakeEventHub();
+  const incomplete = options.incomplete === true;
+  return {
+    id,
+    events,
+    getUsage: incomplete ? () => Promise.reject(new Error('dead')) : () => Promise.resolve(USAGE),
+    getContextSize: incomplete
+      ? () => Promise.reject(new Error('dead'))
+      : () => Promise.resolve({ size: 10, measured: 8, estimated: 2 }),
+    getModelCapabilities: incomplete
+      ? () => Promise.reject(new Error('dead'))
+      : () => Promise.resolve({ max_context_tokens: 128_000 }),
+    getModel: incomplete
+      ? () => Promise.reject(new Error('dead'))
+      : () => Promise.resolve(options.model ?? 'agent-model'),
+  } as unknown as AgentHandle & { id: string };
+}
+
+interface FakeSession {
+  readonly handle: SessionHandle;
+  readonly sessionEvents: FakeEventHub;
+  readonly agentEvents: Map<string, FakeEventHub>;
+  readonly approvalsDecided: Array<{ id: string; response: ApprovalResponse }>;
+  readonly questionsAnswered: Array<{ id: string; result: QuestionResult }>;
+  readonly questionsDismissed: string[];
+  readonly interactionsResponded: Array<{ id: string; response: unknown }>;
+  setPending(pending: readonly Interaction[]): void;
+}
+
+function makeSession(agentIds: string[], agentOptions: FakeAgentOptions = {}): FakeSession {
+  const sessionEvents = new FakeEventHub();
+  const agentEvents = new Map<string, FakeEventHub>();
+  const agentHandles = new Map<string, AgentHandle>();
+  for (const id of agentIds) {
+    const handle = makeAgent(id, agentOptions);
+    agentHandles.set(id, handle);
+    agentEvents.set(id, (handle as unknown as { events: FakeEventHub }).events);
+  }
+  const fake: FakeSession = {
+    sessionEvents,
+    agentEvents,
+    approvalsDecided: [],
+    questionsAnswered: [],
+    questionsDismissed: [],
+    interactionsResponded: [],
+    setPending(pending) {
+      sessionEvents.emit('interactions.changed', pending);
     },
-  });
+    handle: {
+      events: sessionEvents,
+      agents: () =>
+        Promise.resolve(Object.fromEntries(agentIds.map((id) => [id, { id }]))),
+      agent: (id: string) => agentHandles.get(id),
+      interactions: {
+        list: () => Promise.resolve([]),
+        respond: (id: string, response: unknown) => {
+          fake.interactionsResponded.push({ id, response });
+          return Promise.resolve();
+        },
+      },
+      approvals: {
+        list: () => Promise.resolve([]),
+        decide: (id: string, response: ApprovalResponse) => {
+          fake.approvalsDecided.push({ id, response });
+          return Promise.resolve();
+        },
+      },
+      questions: {
+        list: () => Promise.resolve([]),
+        answer: (id: string, result: QuestionResult) => {
+          fake.questionsAnswered.push({ id, result });
+          return Promise.resolve();
+        },
+        dismiss: (id: string) => {
+          fake.questionsDismissed.push(id);
+          return Promise.resolve();
+        },
+      },
+    } as unknown as SessionHandle,
+  };
+  return fake;
+}
+
+function collectingSink(overrides: Partial<SessionEventSink> = {}): {
+  sink: SessionEventSink;
+  events: Event[];
+  approvalRequests: Array<ApprovalRequest & { sessionId: string; agentId: string }>;
+} {
+  const events: Event[] = [];
+  const approvalRequests: Array<ApprovalRequest & { sessionId: string; agentId: string }> = [];
+  return {
+    events,
+    approvalRequests,
+    sink: {
+      receiveEvent: (event) => {
+        events.push(event);
+      },
+      requestApproval: (request) => {
+        approvalRequests.push(request);
+        return Promise.resolve({ decision: 'approved' });
+      },
+      requestQuestion: () => Promise.resolve(null),
+      toolCall: () => Promise.resolve({ output: 'not supported', isError: true }),
+      ...overrides,
+    },
+  };
+}
+
+/** The wiring delivers asynchronously (per-agent chains + facade calls). */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 20; i++) {
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,18 +183,18 @@ function bindStatusServices(agent: FakeAgentHandle, model: string): void {
 // ---------------------------------------------------------------------------
 
 describe('SessionEventWiring status snapshot fold', () => {
-  it('folds a consistent usage + context + model snapshot into every status event', () => {
-    const sub = new FakeAgentHandle('agent-1');
-    bindStatusServices(sub, 'sub-model');
+  it('folds a consistent usage + context + model snapshot into every status event, in order', async () => {
+    const session = makeSession(['agent-1'], { model: 'sub-model' });
     const { sink, events } = collectingSink();
-    const wiring = new SessionEventWiring(makeSession([sub]), sink);
+    const wiring = new SessionEventWiring(session.handle, 's1', sink);
     try {
-      // The v2 model slice rides only the subagent's bind-time emission, which
-      // reaches clients before `subagent.spawned` and is dropped there; a
-      // later usage-only slice must still carry the model at this edge.
-      sub.bus.emit({ type: 'agent.status.updated', usage: USAGE });
-      // Non-status events pass through untouched.
-      sub.bus.emit({ type: 'assistant.delta', delta: 'Hi' });
+      await flush();
+      session.agentEvents.get('agent-1')!.emit('events.raw', {
+        type: 'agent.status.updated',
+        usage: USAGE,
+      });
+      session.agentEvents.get('agent-1')!.emit('events.raw', { type: 'assistant.delta', delta: 'Hi' });
+      await flush();
     } finally {
       wiring.dispose();
     }
@@ -155,47 +213,32 @@ describe('SessionEventWiring status snapshot fold', () => {
     expect(events[1]).not.toHaveProperty('model');
   });
 
-  it('resolves the secondary derived model id to a display string', () => {
-    const sub = new FakeAgentHandle('agent-1');
-    bindStatusServices(sub, SECONDARY_DERIVED_MODEL_ID);
+  it('passes the model alias through unresolved (the catalog display-name lookup is in-process only)', async () => {
+    const session = makeSession(['agent-1'], { model: 'secondary:derived' });
     const { sink, events } = collectingSink();
-    const wiring = new SessionEventWiring(makeSession([sub]), sink);
+    const wiring = new SessionEventWiring(session.handle, 's1', sink);
     try {
-      sub.set(IModelCatalog, {
-        get: (id: string) => {
-          expect(id).toBe(SECONDARY_DERIVED_MODEL_ID);
-          return { id, name: 'kimi-k2-wire', displayName: 'Kimi K2' };
-        },
-      });
-      sub.bus.emit({ type: 'agent.status.updated', usage: USAGE });
-      // Without a displayName the pointed entry's wire name is shown.
-      sub.set(IModelCatalog, { get: (id: string) => ({ id, name: 'kimi-k2-wire' }) });
-      sub.bus.emit({ type: 'agent.status.updated', usage: USAGE });
-      // A resolution failure falls back to the raw alias.
-      sub.set(IModelCatalog, {
-        get: () => {
-          throw new Error('unknown model');
-        },
-      });
-      sub.bus.emit({ type: 'agent.status.updated', usage: USAGE });
+      await flush();
+      session.agentEvents.get('agent-1')!.emit('events.raw', { type: 'agent.status.updated' });
+      await flush();
     } finally {
       wiring.dispose();
     }
 
-    expect(events.map((event) => (event as { model?: string }).model)).toEqual([
-      'Kimi K2',
-      'kimi-k2-wire',
-      SECONDARY_DERIVED_MODEL_ID,
-    ]);
+    expect(events[0]).toMatchObject({ model: 'secondary:derived' });
   });
 
-  it('passes status events through unchanged when the agent services are incomplete', () => {
-    const sub = new FakeAgentHandle('agent-1');
-    // No profile/usage/context/wire services bound — nothing to fold in.
+  it('passes status events through unchanged when the facade reads fail', async () => {
+    const session = makeSession(['agent-1'], { incomplete: true });
     const { sink, events } = collectingSink();
-    const wiring = new SessionEventWiring(makeSession([sub]), sink);
+    const wiring = new SessionEventWiring(session.handle, 's1', sink);
     try {
-      sub.bus.emit({ type: 'agent.status.updated', usage: USAGE });
+      await flush();
+      session.agentEvents.get('agent-1')!.emit('events.raw', {
+        type: 'agent.status.updated',
+        usage: USAGE,
+      });
+      await flush();
     } finally {
       wiring.dispose();
     }
@@ -203,5 +246,112 @@ describe('SessionEventWiring status snapshot fold', () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ type: 'agent.status.updated', usage: USAGE });
     expect(events[0]).not.toHaveProperty('model');
+  });
+});
+
+describe('SessionEventWiring interaction bridge', () => {
+  const approvalInteraction: Interaction = {
+    id: 'appr-1',
+    kind: 'approval',
+    createdAt: 1,
+    origin: { agentId: 'main', turnId: 7 },
+    payload: {
+      toolName: 'Bash',
+      action: 'run',
+      toolCallId: 'call-1',
+      display: { kind: 'generic', detail: { command: 'ls' } },
+    },
+  } as unknown as Interaction;
+
+  it('feeds a pending approval to the sink and writes the decision back', async () => {
+    const session = makeSession([]);
+    const { sink, approvalRequests } = collectingSink();
+    const wiring = new SessionEventWiring(session.handle, 's1', sink);
+    try {
+      session.setPending([approvalInteraction]);
+      await flush();
+    } finally {
+      wiring.dispose();
+    }
+
+    expect(approvalRequests).toHaveLength(1);
+    expect(approvalRequests[0]).toMatchObject({
+      sessionId: 's1',
+      agentId: 'main',
+      toolName: 'Bash',
+      toolCallId: 'call-1',
+    });
+    expect(session.approvalsDecided).toEqual([{ id: 'appr-1', response: { decision: 'approved' } }]);
+  });
+
+  it('bridges each pending interaction exactly once across repeated full-set pushes', async () => {
+    const session = makeSession([]);
+    const { sink, approvalRequests } = collectingSink();
+    const wiring = new SessionEventWiring(session.handle, 's1', sink);
+    try {
+      session.setPending([approvalInteraction]);
+      session.setPending([approvalInteraction]);
+      await flush();
+    } finally {
+      wiring.dispose();
+    }
+
+    expect(approvalRequests).toHaveLength(1);
+    expect(session.approvalsDecided).toHaveLength(1);
+  });
+
+  it('dismisses a question when the sink answers null, and answers otherwise', async () => {
+    const questionInteraction = {
+      id: 'q-1',
+      kind: 'question',
+      createdAt: 1,
+      origin: { agentId: 'main', turnId: 7 },
+      payload: { turnId: 7, questions: [{ question: 'pick one', options: [] }] },
+    } as unknown as Interaction;
+
+    const nullSession = makeSession([]);
+    const nullWiring = new SessionEventWiring(nullSession.handle, 's1', collectingSink().sink);
+    nullSession.setPending([questionInteraction]);
+    await flush();
+    nullWiring.dispose();
+    expect(nullSession.questionsDismissed).toEqual(['q-1']);
+
+    const answeredSession = makeSession([]);
+    const answeredWiring = new SessionEventWiring(
+      answeredSession.handle,
+      's1',
+      collectingSink({
+        requestQuestion: () => Promise.resolve({ answers: { 'pick one': 'a' } }),
+      }).sink,
+    );
+    answeredSession.setPending([questionInteraction]);
+    await flush();
+    answeredWiring.dispose();
+    expect(answeredSession.questionsAnswered).toEqual([
+      { id: 'q-1', result: { answers: { 'pick one': 'a' } } },
+    ]);
+  });
+
+  it('routes user-tool executions to the sink toolCall callback and responds', async () => {
+    const userToolInteraction = {
+      id: 'ut-1',
+      kind: 'user_tool',
+      createdAt: 1,
+      origin: { agentId: 'main', turnId: 7 },
+      payload: { turnId: 7, toolCallId: 'call-9', name: 'custom', args: {} },
+    } as unknown as Interaction;
+
+    const session = makeSession([]);
+    const wiring = new SessionEventWiring(session.handle, 's1', collectingSink().sink);
+    try {
+      session.setPending([userToolInteraction]);
+      await flush();
+    } finally {
+      wiring.dispose();
+    }
+
+    expect(session.interactionsResponded).toEqual([
+      { id: 'ut-1', response: { output: 'not supported', isError: true } },
+    ]);
   });
 });

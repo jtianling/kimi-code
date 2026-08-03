@@ -980,6 +980,9 @@ importers:
       '@moonshot-ai/kaos':
         specifier: workspace:^
         version: link:../kaos
+      '@moonshot-ai/kap-server':
+        specifier: workspace:^
+        version: link:../kap-server
       '@moonshot-ai/kimi-code-oauth':
         specifier: workspace:^
         version: link:../oauth
