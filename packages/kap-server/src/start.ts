@@ -23,6 +23,7 @@ import {
   createKimiDefaultHeaders,
   type KimiHostIdentity,
 } from '@moonshot-ai/kimi-code-oauth';
+import { serveKlientIpc, type KlientIpcHost } from '@moonshot-ai/klient/ipc';
 import { createAsyncApiDocument } from './protocol/asyncapi';
 import Fastify, { type FastifyInstance } from 'fastify';
 
@@ -161,6 +162,16 @@ export interface ServerStartOptions {
    * endpoint unintentionally; the CLI's `kimi web` host passes true.
    */
   readonly telemetry?: boolean;
+  /**
+   * Mount a klient IPC host (unix domain socket) on the SAME bootstrapped
+   * engine scope the REST/WS surface serves, so local in-process clients
+   * (e.g. the TUI) drive the very same engine instance via
+   * `@moonshot-ai/klient/ipc`. The socket lives at
+   * `<homeDir>/server/klient-<boundPort>.sock` and the client `hello` must
+   * carry the persistent bearer token. Defaults to true; a mount failure is
+   * logged and never fails boot.
+   */
+  readonly klientIpc?: boolean;
 }
 
 export interface RunningServer {
@@ -170,6 +181,8 @@ export interface RunningServer {
   readonly authTokenService: IAuthTokenService;
   readonly host: string;
   readonly port: number;
+  /** Present when the klient IPC host mounted successfully (see `klientIpc`). */
+  readonly klientIpcSocketPath?: string;
   close(): Promise<void>;
 }
 
@@ -256,6 +269,11 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     },
     [...logSeed(logging), ...(opts.seeds ?? [])],
   );
+
+  // Klient IPC host serving the same `core` scope over a unix socket. Mounted
+  // after the HTTP listener binds (the socket name carries the bound port);
+  // closed before the engine scope is disposed.
+  let klientIpcHost: KlientIpcHost | undefined;
 
   // Attach the cloud telemetry appender BEFORE any session is created:
   // `session_started` / `session_load_failed` fire inside create()/resume(), so
@@ -351,6 +369,8 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
 
   const close = async (): Promise<void> => {
     await app.close();
+    // Stop serving the engine scope over IPC before disposing the engine.
+    await klientIpcHost?.close();
     authFailureLimiter?.dispose();
     modelCatalogRefreshScheduler.dispose();
     // Telemetry is best-effort and must never prevent core or instance cleanup.
@@ -610,6 +630,26 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
   // registry finds the real listener.
   await registration.update({ port: boundPort });
 
+  // Mount the klient IPC host on the same engine scope. The socket name
+  // carries the actually-bound port so a consumer that discovers this server
+  // through the instance registry (which now advertises `boundPort`) can
+  // derive the path. Best-effort: the REST/WS surface must not depend on it.
+  if (opts.klientIpc !== false) {
+    try {
+      const socketPath = join(homeDir, 'server', `klient-${boundPort}.sock`);
+      klientIpcHost = await serveKlientIpc({
+        scope: core,
+        socketPath,
+        token: authTokenService.getToken(),
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error instanceof Error ? error.message : String(error) },
+        'klient IPC mount failed; continuing without the IPC surface',
+      );
+    }
+  }
+
   void modelCatalogRefreshScheduler.start().catch((error) => {
     logger.warn(
       { err: error instanceof Error ? error.message : String(error) },
@@ -617,7 +657,16 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     );
   });
 
-  return { app, core, connectionRegistry, authTokenService, host, port: boundPort, close };
+  return {
+    app,
+    core,
+    connectionRegistry,
+    authTokenService,
+    host,
+    port: boundPort,
+    klientIpcSocketPath: klientIpcHost?.socketPath,
+    close,
+  };
 }
 
 /**
