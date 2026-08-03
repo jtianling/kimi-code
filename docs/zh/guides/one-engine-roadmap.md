@@ -6,6 +6,8 @@
 本文描述的是进行中的架构迁移路线，不是当前发布版本的行为。当前发布行为见[会话与上下文](./sessions.md)。
 :::
 
+**当前进度（2026-08-02）**：里程碑 1、3、4 已完成，剩余里程碑 2（C 类 reverse-rpc 重写）与后续 TUI 切流。`reloadSession` 按停止规则从里程碑 3 跳过——v2 无任何可上线的 reload 语义（`core-api.ts:338` 是死声明，唯一移植是 sdk-rpc-client-v2 的进程内组合），重实现属新行为而非镜像；单引擎后 TUI 不再持有独立上下文，该概念随之消失。
+
 ## 背景：双引擎接缝
 
 今天的 TUI 在自己的进程里内嵌一个引擎实例（`agent-core`，经 `@moonshot-ai/kimi-code-sdk` 的内存 RPC 访问）；kap-server（`kimi web`）进程里是另一个引擎实例（`agent-core-v2`）。两者可以加载同一条 session（同一份磁盘持久化），但各自持有独立的内存上下文，磁盘是唯一交汇点——这就是「双引擎接缝」。
@@ -87,8 +89,8 @@
 
 | TUI 方法 | 现状 |
 |---|---|
-| `getCronTasks` | `session/cron/sessionCronService.ts` 有完整服务与 agent 工具，但没有任何 RPC。新增时只把真正需要跨进程的方法上线，纯计算方法（如 `computeDisplayNextFire`）留在客户端 |
-| `applyPersistedSecondaryModel` | v2 无 1：1 对应，只有 `secondaryModel` 配置段（`app/kosongConfig/configSection.ts:314`），需新增 RPC 或改走配置路径 |
+| `getCronTasks` | **已上线（2026-08-02）**。经 `sessionCronService` 域服务直连（`list` + `getNextFireForTask`），无需 core-api RPC；facade 组合出 v1 的 `nextFireAt` 快照，纯计算（`computeDisplayNextFire`）留在客户端 |
+| `applyPersistedSecondaryModel` | **已上线（2026-08-02）**。facade 组合现有服务：config reload → 读 `secondaryModel` 配置段 → `modelService.get` 校验配方 → `sessionSecondaryModelWarningService.recheck` 刷新警告，未新增引擎能力 |
 
 ### E 类 — 不迁移（4）
 
@@ -98,13 +100,9 @@
 
 按依赖顺序切四个里程碑，各自独立可验证。
 
-### 里程碑 1：kap-server 挂载 klient IPC（前置，约 5-15 行）
+### 里程碑 1：kap-server 挂载 klient IPC（前置，约 5-15 行）—— 已完成
 
-`serveKlientIpc({ scope, socketPath, token })`（`packages/klient/src/transports/ipc/host.ts:51`）服务一个已 bootstrap 的引擎 scope，自己不创建引擎；而 `packages/kap-server/src` 至今对 klient 零引用。接入点就在 `packages/kap-server/src/start.ts:242` bootstrap 出 `core: Scope` 之后：import + `await serveKlientIpc(...)` 持有句柄 + `close()`（`start.ts:352-374`）内补 `await klientIpc.close()`。
-
-需要决策的只有两件事：socketPath 约定（建议 `<home>/server/klient-<port>.sock`）与 token（可复用 `authTokenService` 的持久 token，`start.ts:216-227`）。
-
-**验收**：TUI 经 klient IPC 连上 kap-server 后，「只靠 klient 完成一次完整对话」从纸面推演变成可实测的问题。这一步做完才能谈后面的一切。
+`serveKlientIpc({ scope, socketPath, token })`（`packages/klient/src/transports/ipc/host.ts:51`）服务一个已 bootstrap 的引擎 scope，自己不创建引擎。接入点就在 `packages/kap-server/src/start.ts` bootstrap 出 `core: Scope` 之后，socket 为 `<home>/server/klient-<实际绑定端口>.sock`，token 复用 `authTokenService` 的持久 token，`close()` 在引擎 dispose 前关闭；挂载失败只告警不阻断启动。自动化测试（`packages/kap-server/test/klientIpc.test.ts`）证明：klient 经 unix socket 完成一轮完整对话，且该轮次经同一 session 的 REST transcript 可读——IPC 与 REST 同引擎。
 
 ### 里程碑 2：C 类 reverse-rpc 重写（唯一的设计工作）
 
@@ -112,17 +110,13 @@
 
 **验收**：YOLO 模式关闭时，工具审批、用户提问在 klient-only 的 TUI 上完整可用。
 
-### 里程碑 3：B 类契约补全（机械主体）
+### 里程碑 3：B 类契约补全（机械主体）—— 已完成
 
-按上表约 20 项逐一补 zod schema（镜像域服务接口）+ facade 接线 + `contract-parity` 断言。调用密度可作为排序依据——密度 Top 5：`setPermission`（15 点）、`setModel`（5）、`getStatus`（5）、`getGoal`（5）、`cancel`（4）。
+上表条目除 `reloadSession`（按停止规则跳过，见文首进度说明）外全部上线：zod schema 镜像域服务接口 + facade 接线 + `contract-parity` 断言。几处落点与假设不同，已验证并记录：`activateSkill` 走 `agentRPCService`（域服务返回不可序列化的 `Turn`）；`listSkills` 由 dispatcher 按 `modelResolver.generate` 先例合成；`cancelCompaction` 走 RPC 层（域服务无 cancel）；`setActiveTools` 走 `IAgentProfileService.update`；MCP 读面在 agent scope 的 `IAgentMcpService`。TUI 的 SDK 调用点切换是后续切流工作。
 
-**验收**：52 个 TUI 方法中除 C/D/E 类外全部经 klient 可用，TUI 的 SDK 调用点逐批切到 klient facade。
+### 里程碑 4：D 类尾巴 —— 已完成
 
-### 里程碑 4：D 类尾巴
-
-新增 cron RPC（挑出跨进程必需的子集）与 `applyPersistedSecondaryModel` 的上线路径。
-
-**验收**：TUI cron 面板与 secondary model 持久化在 klient-only 模式下工作。
+cron 经 `sessionCronService` 域服务直连上线（只读 `list` + `getNextFireForTask`），`applyPersistedSecondaryModel` 经 facade 组合现有服务上线（config reload → 配置段读取 → 配方校验 → 警告刷新），均未新增引擎 RPC。契约地图至此 100% 完整。
 
 ## 完成后的收益
 
@@ -131,6 +125,6 @@
 ## 已知风险与未决项
 
 - C 类是唯一没有编译器兜底的部分，重写 reverse-rpc 层时需要逐弹窗场景核对（审批、提问、权限升级）。
-- `reloadSession` 在单引擎后大概率失去意义（TUI 不再持有独立上下文），但里程碑 3 期间 TUI 仍是混合形态，该项契约需要补齐作为过渡。
-- v2 `core-api.ts:157-159` 残留死代码 `EnterSwarmPayload`，补 swarm 契约时可顺手清理。
+- `reloadSession` 已按停止规则从里程碑 3 跳过（v2 无可上线等价物；单引擎后该概念消失），不再占用后续工作。
+- v2 `core-api.ts:157-159` 残留死代码 `EnterSwarmPayload`，补 swarm 契约时可顺手清理（里程碑 3 未触及）。
 - `setPermission` 在生产 REST 仅作为 prompt body 字段部分暴露，无独立路由；klient 契约已有，不受影响，但 REST 面补齐是另一个独立话题。

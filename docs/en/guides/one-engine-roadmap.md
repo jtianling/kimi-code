@@ -6,6 +6,8 @@ This page is the work map for migrating the Kimi Code CLI terminal UI (TUI) from
 This page describes an in-progress architecture migration, not the behavior of the current release. For current behavior, see [Sessions and context](./sessions.md).
 :::
 
+**Current progress (2026-08-02)**: milestones 1, 3, and 4 are done; milestone 2 (the class-C reverse-rpc rewrite) and the TUI cutover remain. `reloadSession` was skipped under the stop rule — v2 has no wire-exposable reload semantics (`core-api.ts:338` is a dead declaration; the only port is sdk-rpc-client-v2's in-process composition), and reimplementing it would be new behavior rather than mirroring. With one engine the TUI no longer holds a separate context, so the concept disappears.
+
 ## Background: the dual-engine seam
 
 Today the TUI embeds an engine instance in its own process (`agent-core`, reached through in-memory RPC in `@moonshot-ai/kimi-code-sdk`); the kap-server process (`kimi web`) hosts another engine instance (`agent-core-v2`). Both can load the same session (the same on-disk persistence), but each holds its own in-memory context — the disk is the only rendezvous point. This is the "dual-engine seam".
@@ -88,8 +90,8 @@ The capability exists, but the shape changes from callbacks to pull/respond, and
 
 | TUI method | Status |
 |---|---|
-| `getCronTasks` | `session/cron/sessionCronService.ts` has a complete service plus agent tools, but no RPC at all. When adding one, expose only the methods that truly need to cross processes; pure computation (e.g. `computeDisplayNextFire`) stays client-side |
-| `applyPersistedSecondaryModel` | no 1:1 counterpart in v2, only the `secondaryModel` config section (`app/kosongConfig/configSection.ts:314`); needs a new RPC or a config-based path |
+| `getCronTasks` | **Wired (2026-08-02)**. Served by direct domain-service access on `sessionCronService` (`list` + `getNextFireForTask`) — no core-api RPC needed; the facade composes the v1 `nextFireAt` snapshot and pure computation (`computeDisplayNextFire`) stays client-side |
+| `applyPersistedSecondaryModel` | **Wired (2026-08-02)**. The facade composes existing services: config reload → read the `secondaryModel` section → validate the recipe via `modelService.get` → refresh the warning via `sessionSecondaryModelWarningService.recheck`; no new engine capability |
 
 ### Class E — not migrating (4)
 
@@ -99,13 +101,9 @@ The capability exists, but the shape changes from callbacks to pull/respond, and
 
 Four milestones in dependency order, each independently verifiable.
 
-### Milestone 1: mount klient IPC in kap-server (prerequisite, ~5-15 lines)
+### Milestone 1: mount klient IPC in kap-server (prerequisite, ~5-15 lines) — done
 
-`serveKlientIpc({ scope, socketPath, token })` (`packages/klient/src/transports/ipc/host.ts:51`) serves an already-bootstrapped engine scope; it does not create an engine. Today `packages/kap-server/src` has zero references to klient. The attachment point is right after `bootstrap` produces `core: Scope` at `packages/kap-server/src/start.ts:242`: one import, `await serveKlientIpc(...)` holding the handle, and `await klientIpc.close()` inside `close()` (`start.ts:352-374`).
-
-Only two decisions are needed: the socketPath convention (suggested `<home>/server/klient-<port>.sock`) and the token (the persistent token from `authTokenService` can be reused, `start.ts:216-227`).
-
-**Acceptance**: with the TUI connected to kap-server over klient IPC, "can the TUI complete a full conversation on klient alone" turns from paper reasoning into a testable question. Everything after this depends on it.
+`serveKlientIpc({ scope, socketPath, token })` (`packages/klient/src/transports/ipc/host.ts:51`) serves an already-bootstrapped engine scope; it does not create an engine. The attachment point is right after `bootstrap` produces `core: Scope` in `packages/kap-server/src/start.ts`; the socket is `<home>/server/klient-<boundPort>.sock`, the token reuses the persistent `authTokenService` token, and `close()` stops the IPC host before the engine is disposed. A mount failure logs a warning and never fails boot. An automated test (`packages/kap-server/test/klientIpc.test.ts`) proves a klient over the unix socket completes a full turn that is then readable through the same session's REST transcript — IPC and REST share one engine.
 
 ### Milestone 2: class C reverse-rpc rewrite (the only design work)
 
@@ -113,17 +111,13 @@ Rewrite the `src/tui/reverse-rpc/` layer: approvals and questions change from "e
 
 **Acceptance**: with YOLO mode off, tool approvals and user questions work end-to-end on a klient-only TUI.
 
-### Milestone 3: class B contract completion (the mechanical bulk)
+### Milestone 3: class B contract completion (the mechanical bulk) — done
 
-For each of the ~20 items in the table above: add the zod schema (mirroring the domain service interface), wire the facade, extend the `contract-parity` assertions. Use call density as the ordering heuristic — top 5: `setPermission` (15 call sites), `setModel` (5), `getStatus` (5), `getGoal` (5), `cancel` (4).
+Every item in the table above is wired except `reloadSession` (skipped under the stop rule, see the progress note up top): zod schemas mirroring the domain service interfaces, facade wiring, and `contract-parity` assertions. A few landings deviate from the initial guesses, verified and recorded: `activateSkill` goes through `agentRPCService` (the domain service returns a non-serializable `Turn`); `listSkills` is synthesized in the dispatcher following the `modelResolver.generate` precedent; `cancelCompaction` goes through the RPC layer (the domain service has no cancel); `setActiveTools` goes through `IAgentProfileService.update`; the MCP read side lives on the agent-scoped `IAgentMcpService`. Switching the TUI's SDK call sites over is the later cutover work.
 
-**Acceptance**: of the 52 TUI methods, everything outside classes C/D/E is reachable through klient, and the TUI's SDK call sites switch to the klient facade in batches.
+### Milestone 4: class D tail — done
 
-### Milestone 4: class D tail
-
-Add the cron RPC (only the cross-process subset) and a wire path for `applyPersistedSecondaryModel`.
-
-**Acceptance**: the TUI cron panel and secondary-model persistence work in klient-only mode.
+Cron is wired via direct `sessionCronService` access (read-only `list` + `getNextFireForTask`), and `applyPersistedSecondaryModel` is wired as a facade composition over existing services (config reload → section read → recipe validation → warning refresh) — neither needed a new engine RPC. The contract map is now 100% complete.
 
 ## Payoff
 
@@ -132,6 +126,6 @@ Once one-engine lands, the entire direction-A `ServerTurnObserver` mechanism (We
 ## Known risks and open items
 
 - Class C is the only part without compiler backup; the reverse-rpc rewrite needs per-dialog verification (approvals, questions, permission escalation).
-- `reloadSession` likely becomes meaningless after one-engine (the TUI no longer holds a separate context), but during milestone 3 the TUI is still a hybrid — the contract is needed as a bridge.
-- `core-api.ts:157-159` has leftover dead code (`EnterSwarmPayload`); clean it up while adding the swarm contract.
+- `reloadSession` was skipped under the stop rule (no wire-exposable v2 equivalent; the concept disappears with one engine) and no longer blocks later work.
+- `core-api.ts:157-159` has leftover dead code (`EnterSwarmPayload`); milestone 3 did not touch it — clean it up when adding the swarm contract's follow-ups.
 - `setPermission` is only partially exposed on production REST (as a prompt body field, no dedicated route); the klient contract is unaffected, but completing the REST surface is a separate topic.
