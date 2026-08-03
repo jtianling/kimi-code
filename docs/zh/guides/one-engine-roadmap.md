@@ -6,7 +6,7 @@
 本文描述的是进行中的架构迁移路线，不是当前发布版本的行为。当前发布行为见[会话与上下文](./sessions.md)。
 :::
 
-**当前进度（2026-08-02）**：里程碑 1、3、4 已完成，剩余里程碑 2（C 类 reverse-rpc 重写）与后续 TUI 切流。`reloadSession` 按停止规则从里程碑 3 跳过——v2 无任何可上线的 reload 语义（`core-api.ts:338` 是死声明，唯一移植是 sdk-rpc-client-v2 的进程内组合），重实现属新行为而非镜像；单引擎后 TUI 不再持有独立上下文，该概念随之消失。
+**当前进度（2026-08-02）**：全部里程碑已完成。里程碑 1（IPC 挂载）、3（B 类契约）、4（D 类尾巴）、2（交互桥线上化）与 TUI 切流两阶段（SDK 全面 facade 化 + harness/CLI 远程模式）均已落地：TUI 可经 `KIMI_REMOTE=1`（或 `KIMI_REMOTE_SOCKET`）连到 kap-server 托管的同一个引擎，`ServerTurnObserver` 在远程模式下自动惰性。`reloadSession` 按停止规则从里程碑 3 跳过——v2 无任何可上线的 reload 语义（`core-api.ts:338` 是死声明，唯一移植是 sdk-rpc-client-v2 的进程内组合），重实现属新行为而非镜像；单引擎后 TUI 不再持有独立上下文，该概念随之消失。
 
 ## 背景：双引擎接缝
 
@@ -106,9 +106,19 @@
 
 ### 里程碑 2：C 类 reverse-rpc 重写（唯一的设计工作）
 
-重写 `src/tui/reverse-rpc/` 层：审批与提问从「引擎回调 TUI」改为「TUI 轮询/订阅 pending 列表并应答」，事件从 `onEvent` 回调改为 klient `events.*` hub 订阅。建议单独立项，不与机械工作混合。
+设计已定稿（2026-08-02，经代码核对修正）。核心转变：审批/提问从「引擎回调 TUI」（v1 的 `setApprovalHandler` / `setQuestionHandler` 反向 RPC）改为「引擎 pending 交互列表为唯一真源，客户端订阅渲染并应答」。
 
-**验收**：YOLO 模式关闭时，工具审批、用户提问在 klient-only 的 TUI 上完整可用。
+**关键事实：这座桥已经存在，但是进程内的。** `packages/node-sdk/src/v2/session-wiring.ts` 的 `SessionEventWiring` 正是本设计的进程内实现——它订阅 `ISessionInteractionService.onDidChangePending`，把 pending 交互（approval / question / **user_tool**，三类都已桥接）喂给 TUI 的 v1 回调，经 `ISessionApprovalService.decide` / `ISessionQuestionService.answer|dismiss` / 内核 `respond` 写回。TUI 的 reverse-rpc 面板层（`types.ts` / `adapter.ts` / `modal-coordinator.ts` / controllers）**全部保留不动**，因为 SDK v2 客户端维持了 v1 的 API 形状。`user_tool` 不是缺口：`bridgeUserTool` 已把它路由给客户端的 `toolCall` 回调。
+
+因此 M2 的真实工作是把这座桥**改写为走 klient facade（传输无关）**，而不是在 TUI 里新建 watcher：
+
+1. **交互桥线上化。** klient session 事件 hub 已有 `interactions.changed`（全量 pending 列表推送）+ `listPending()` 基线 + `decide` / `answer` / `dismiss` / `respond`——`SessionEventWiring` 的桥接逻辑可以逐句映射到 facade 调用，dedup 集合与写回语义不变。memory 与 ipc 传输按构造字节一致，facade 化即自动获得远程能力。
+2. **事件流线上化（主要工作量）。** 进程内 wiring 直接订阅每个 agent 的 `IEventBus` 原始流（含中途出现的子 agent），klient hub 目前只注册 13 种事件类型。但 klient dispatcher 的 agent `events` 流本就转发全量原始总线（hub 的 13 种只是 facade 层策展）——在 klient 增加一个原始全保真 agent 事件订阅（不过滤 `type` 的流注册），`translateDomainEvent`（丢弃 v2-only 类型、`task.*` → `background.task.*` 改名、补 sessionId/agentId 戳）继续留在客户端。子 agent 发现：`metadata.changed`（session hub 事件，携带 agents 表）+ 原始流兜底。
+3. **`withStatusSnapshot` 增强的取舍。** 进程内版在 `agent.status.updated` 事件边缘融合 usage/contextTokens/model 快照，用到 `IAgentUsageService` / `IAgentProfileService`（已上线）与 `IAgentContextSizeService` / `IWireService` / `IModelCatalog`（未上线）。优先按 B 类模式补这几个只读契约；若某项镜像不通，接受降级快照并记录。
+
+生命周期与竞态语义沿用进程内版已证明的性质：pending 全量推送天然幂等；中途 attach 经 `listPending()` 基线接住存量；迟到的应答对内核 `respond` 是安全 no-op；切 session 只退订不取消。
+
+**验收**：交互桥与事件流在 memory 与 ipc 双传输下行为一致——memory 模式（现有 TUI v2 路径）无回归，且有 ipc 传输的集成测试证明审批/提问/事件经 unix socket 端到端可用（YOLO 关闭时）。
 
 ### 里程碑 3：B 类契约补全（机械主体）—— 已完成
 
@@ -121,6 +131,8 @@ cron 经 `sessionCronService` 域服务直连上线（只读 `list` + `getNextFi
 ## 完成后的收益
 
 单引擎落地后，方案 A 的 `ServerTurnObserver` 整套机制（WebSocket 订阅、input gate、Esc hatch、磁盘重放）整体退役：外部客户端经 REST 注入的轮次与 TUI 操作落在同一个引擎上，轮次事件经 klient events hub 直接流式到 TUI，无接缝、无重放、无并发写风险。
+
+**落地状态（2026-08-02）**：远程模式已实现为 opt-in（`KIMI_REMOTE=1` / `KIMI_REMOTE=auto` / `KIMI_REMOTE_SOCKET`，见 `apps/kimi-code/src/cli/remote.ts`），observer 在远程模式下自动惰性；进程内引擎仍是默认，observer 代码为进程内模式保留，待远程模式成为默认后统一清理。xats 场景下 `KIMI_REMOTE=auto` 会经 `KIMI_XATS_BASE_URL` / `KIMI_XATS_SESSION_ID` 自动选中 launcher 命名的 server。
 
 ## 已知风险与未决项
 

@@ -6,7 +6,7 @@ This page is the work map for migrating the Kimi Code CLI terminal UI (TUI) from
 This page describes an in-progress architecture migration, not the behavior of the current release. For current behavior, see [Sessions and context](./sessions.md).
 :::
 
-**Current progress (2026-08-02)**: milestones 1, 3, and 4 are done; milestone 2 (the class-C reverse-rpc rewrite) and the TUI cutover remain. `reloadSession` was skipped under the stop rule — v2 has no wire-exposable reload semantics (`core-api.ts:338` is a dead declaration; the only port is sdk-rpc-client-v2's in-process composition), and reimplementing it would be new behavior rather than mirroring. With one engine the TUI no longer holds a separate context, so the concept disappears.
+**Current progress (2026-08-02)**: all milestones are done. Milestones 1 (IPC mount), 3 (class-B contracts), 4 (class-D tail), 2 (interaction bridge over the wire), and both TUI-cutover phases (full SDK facade migration + harness/CLI remote mode) have landed: the TUI can attach to a kap-server-hosted engine via `KIMI_REMOTE=1` (or `KIMI_REMOTE_SOCKET`), and the `ServerTurnObserver` goes inert automatically in remote mode. `reloadSession` was skipped under the stop rule — v2 has no wire-exposable reload semantics (`core-api.ts:338` is a dead declaration; the only port is sdk-rpc-client-v2's in-process composition), and reimplementing it would be new behavior rather than mirroring. With one engine the TUI no longer holds a separate context, so the concept disappears.
 
 ## Background: the dual-engine seam
 
@@ -107,9 +107,19 @@ Four milestones in dependency order, each independently verifiable.
 
 ### Milestone 2: class C reverse-rpc rewrite (the only design work)
 
-Rewrite the `src/tui/reverse-rpc/` layer: approvals and questions change from "engine calls back into the TUI" to "the TUI polls/subscribes the pending list and responds"; events change from the `onEvent` callback to a klient `events.*` hub subscription. Track this as its own change, not mixed with the mechanical work.
+Design finalized (2026-08-02, corrected after code verification). The core shift: approvals and questions move from "engine calls back into the TUI" (v1's `setApprovalHandler` / `setQuestionHandler` reverse RPC) to "the engine's pending-interaction list is the single source of truth; the client subscribes, renders, and responds".
 
-**Acceptance**: with YOLO mode off, tool approvals and user questions work end-to-end on a klient-only TUI.
+**Key fact: the bridge already exists, in-process.** `SessionEventWiring` in `packages/node-sdk/src/v2/session-wiring.ts` is exactly this design implemented in-process — it subscribes `ISessionInteractionService.onDidChangePending`, feeds pending interactions (approval / question / **user_tool** — all three kinds are bridged) to the TUI's v1 callbacks, and writes outcomes back via `ISessionApprovalService.decide` / `ISessionQuestionService.answer|dismiss` / the kernel's `respond`. The TUI's reverse-rpc panel layer (`types.ts` / `adapter.ts` / `modal-coordinator.ts` / controllers) **survives untouched**, because the SDK v2 client preserves the v1 API shape. `user_tool` is not a gap: `bridgeUserTool` already routes it to the client's `toolCall` callback.
+
+M2's real work is therefore re-expressing this bridge **over the klient facade (transport-agnostic)**, not building a new watcher in the TUI:
+
+1. **Wire the interaction bridge.** The klient session events hub already has `interactions.changed` (full pending-list pushes) + a `listPending()` baseline + `decide` / `answer` / `dismiss` / `respond` — the wiring's bridge logic maps line-for-line onto facade calls, with the dedup set and write-back semantics unchanged. The memory and ipc transports are byte-identical by construction, so going through the facade yields remote capability for free.
+2. **Wire the event stream (the bulk of the work).** The in-process wiring subscribes every agent's raw `IEventBus` stream (including subagents appearing mid-turn); the klient hub currently registers only 13 curated event types. But the klient dispatcher's agent `events` stream already forwards the full raw bus (the 13 types are facade-level curation) — add a raw, full-fidelity agent event subscription to klient (a stream registration without a `type` filter), and keep `translateDomainEvent` (dropping v2-only types, renaming `task.*` → `background.task.*`, stamping sessionId/agentId) client-side. Subagent discovery: `metadata.changed` (a session hub event carrying the agents table) with the raw stream as backstop.
+3. **The `withStatusSnapshot` trade-off.** The in-process version folds a usage/contextTokens/model snapshot into `agent.status.updated` at the edge, using `IAgentUsageService` / `IAgentProfileService` (already wired) plus `IAgentContextSizeService` / `IWireService` / `IModelCatalog` (not wired). Prefer wiring those read-only contracts following the class-B pattern; where mirroring fails, accept a degraded snapshot and record it.
+
+Lifecycle and race semantics inherit the properties already proven in-process: full-list pushes are naturally idempotent; mid-attach catch-up comes from the `listPending()` baseline; a late answer is a safe no-op against the kernel's `respond`; switching sessions unsubscribes without cancelling.
+
+**Acceptance**: the interaction bridge and event stream behave identically on both transports — no regression in memory mode (the current TUI v2 path), plus an integration test over the ipc transport proving approvals, questions, and events work end-to-end through a unix socket (with YOLO off).
 
 ### Milestone 3: class B contract completion (the mechanical bulk) — done
 
@@ -122,6 +132,8 @@ Cron is wired via direct `sessionCronService` access (read-only `list` + `getNex
 ## Payoff
 
 Once one-engine lands, the entire direction-A `ServerTurnObserver` mechanism (WebSocket subscription, input gate, Esc hatch, disk replay) retires: turns injected by external clients over REST and TUI operations land on the same engine, and turn events stream directly to the TUI through the klient events hub — no seam, no replay, no concurrent writes.
+
+**Landing status (2026-08-02)**: remote mode ships as opt-in (`KIMI_REMOTE=1` / `KIMI_REMOTE=auto` / `KIMI_REMOTE_SOCKET`, see `apps/kimi-code/src/cli/remote.ts`), with the observer automatically inert in remote mode. The in-process engine remains the default and the observer code is kept for it, to be removed once remote mode becomes the default. Under xats, `KIMI_REMOTE=auto` picks the launcher-named server through `KIMI_XATS_BASE_URL` / `KIMI_XATS_SESSION_ID`.
 
 ## Known risks and open items
 
