@@ -58,6 +58,8 @@ export type {
 
 export type {
   AddAdditionalDirResult,
+  CronTask,
+  CronTaskSnapshot,
   McpServerInfo,
   McpStartupMetrics,
   SessionApprovalsFacade,

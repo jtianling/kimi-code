@@ -56,6 +56,7 @@ import type {
 import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 import type { McpServerEntry } from '@moonshot-ai/agent-core-v2/mcpCore/connection-manager';
 import type { SecondaryModelWarning } from '@moonshot-ai/agent-core-v2/session/subagent/secondaryModelWarning';
+import type { CronTask } from '@moonshot-ai/agent-core-v2/app/cron/cronTask';
 import type {
   WorkspaceAddDirInput,
   WorkspaceAdditionalDirsResult,
@@ -195,6 +196,7 @@ import {
 import { skillSummarySchema } from '../src/contract/session/skillCatalog.js';
 import { mcpServerEntrySchema } from '../src/contract/agent/mcp.js';
 import { secondaryModelWarningSchema } from '../src/contract/session/secondaryModelWarning.js';
+import { cronTaskSchema } from '../src/contract/session/cron.js';
 import {
   workspaceAddDirInputSchema,
   workspaceAdditionalDirsResultSchema,
@@ -587,6 +589,7 @@ const _secondaryModelWarning: AssertWire<
   typeof secondaryModelWarningSchema,
   SecondaryModelWarning
 > = true;
+const _cronTask: AssertWire<typeof cronTaskSchema, CronTask> = true;
 const _mcpServerEntry: AssertWire<typeof mcpServerEntrySchema, McpServerEntry> = true;
 const _workspaceAddDirInput: AssertWire<typeof workspaceAddDirInputSchema, WorkspaceAddDirInput> =
   true;

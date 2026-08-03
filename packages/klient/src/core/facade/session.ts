@@ -12,7 +12,9 @@
 
 import type { AgentActivityState } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
 import type { IAgentMcpService } from '@moonshot-ai/agent-core-v2/agent/mcp/mcp';
+import { SECONDARY_MODEL_SECTION } from '@moonshot-ai/agent-core-v2/app/kosongConfig/configSection';
 import type { SessionWarning } from '@moonshot-ai/agent-core-v2/app/sessionLegacy/sessionProtocol';
+import type { ISessionCronService } from '@moonshot-ai/agent-core-v2/session/cron/sessionCronService';
 import type { SecondaryModelWarning } from '@moonshot-ai/agent-core-v2/session/subagent/secondaryModelWarning';
 import type { IWorkspaceDirs } from '@moonshot-ai/agent-core-v2/workspace/workspaceDirs/workspaceDirs';
 import type {
@@ -38,6 +40,7 @@ import { RPCError } from '../errors.js';
 import type { ScopedCaller } from './global.js';
 
 const NOT_FOUND = 40404;
+const REQUEST_INVALID = 40001;
 
 export type { ScopedCaller } from './global.js';
 
@@ -87,6 +90,12 @@ export interface McpStartupMetrics {
 /** What `IWorkspaceDirs.addDir` leaves on the wire. */
 export type AddAdditionalDirResult = Awaited<ReturnType<IWorkspaceDirs['addDir']>>;
 
+/** One cron task as `ISessionCronService.list` reports it. */
+export type CronTask = Awaited<ReturnType<ISessionCronService['list']>>[number];
+
+/** v1's `CronTaskSnapshot` — the task plus its post-jitter next fire time. */
+export type CronTaskSnapshot = CronTask & { readonly nextFireAt: number | null };
+
 export interface SessionFacade {
   get(): Promise<SessionMeta>;
   setTitle(title: string): Promise<void>;
@@ -127,6 +136,19 @@ export interface SessionFacade {
    * `persist` defaults to the engine default (`true` → `.kimi-code/local.toml`).
    */
   addAdditionalDir(path: string, options?: { persist?: boolean }): Promise<AddAdditionalDirResult>;
+  /**
+   * Cron tasks of this session with their post-jitter next fire times
+   * (mirrors the v1 SDK `Session.getCronTasks`). The schedule expression is
+   * returned raw — display formatting stays client-side.
+   */
+  getCronTasks(): Promise<{ readonly tasks: readonly CronTaskSnapshot[] }>;
+  /**
+   * Reload the global config, validate the persisted secondary-model recipe,
+   * and refresh the session's secondary-model warning (mirrors the v1 SDK
+   * `Session.applyPersistedSecondaryModel`). Throws when no secondary model
+   * is persisted or its recipe is unknown.
+   */
+  applyPersistedSecondaryModel(): Promise<void>;
   readonly approvals: SessionApprovalsFacade;
   readonly questions: SessionQuestionsFacade;
   readonly interactions: SessionInteractionsFacade;
@@ -257,6 +279,40 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
       return call({ workspaceId }, 'workspaceDirs', 'addDir', [
         { path, persist: options?.persist },
       ]) as Promise<AddAdditionalDirResult>;
+    },
+    getCronTasks: async () => {
+      const tasks = (await call(scope, 'sessionCronService', 'list', [])) as readonly CronTask[];
+      const snapshots = await Promise.all(
+        tasks.map(async (task) => ({
+          ...task,
+          nextFireAt: (await call(scope, 'sessionCronService', 'getNextFireForTask', [
+            task.id,
+          ])) as number | null,
+        })),
+      );
+      return { tasks: snapshots };
+    },
+    applyPersistedSecondaryModel: async () => {
+      await call({}, 'configService', 'reload', []);
+      const secondary = (await call({}, 'configService', 'get', [SECONDARY_MODEL_SECTION])) as
+        | { model?: string }
+        | undefined;
+      if (secondary?.model === undefined) {
+        throw new RPCError(
+          REQUEST_INVALID,
+          'Cannot apply the secondary model: persist its recipe before applying it to a session.',
+        );
+      }
+      // Recipe-level validation; deeper resolution problems surface through
+      // the rechecked warning below (readable via getSessionWarnings).
+      const recipe = (await call({}, 'modelService', 'get', [secondary.model])) as
+        | Record<string, unknown>
+        | null
+        | undefined;
+      if (recipe === undefined || recipe === null) {
+        throw new RPCError(NOT_FOUND, `secondary model not configured: ${secondary.model}`);
+      }
+      await call(scope, 'sessionSecondaryModelWarningService', 'recheckSecondaryModelWarning', []);
     },
 
     approvals: {

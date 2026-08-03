@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { defineKlientConformance } from './helpers/conformance.js';
+import { getLiveSessionById } from '@moonshot-ai/agent-core-v2/app/workspaceLifecycle/sessionLookup';
+import { ISessionCronService } from '@moonshot-ai/agent-core-v2/session/cron/sessionCronService';
 import type { AgentHandle, Klient } from '../src/index.js';
 import { createKlient } from '../src/transports/memory/index.js';
 import { createMemoryDispatcher } from '../src/transports/memory/dispatcher.js';
@@ -281,5 +283,74 @@ describe('session facade (real engine)', () => {
     } finally {
       await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
     }
+  });
+});
+
+describe('session facade cron & secondary model (real engine)', () => {
+  let engine: TestEngine;
+  let klient: Klient;
+  let sessionId: string;
+
+  beforeAll(async () => {
+    engine = await makeEngine();
+    klient = createKlient({ scope: engine.app });
+    await klient.global.config.replaceSections({
+      sections: {
+        providers: {
+          'cron-secondary': { type: 'openai', baseUrl: 'http://127.0.0.1:1', apiKey: 'k' },
+        },
+        models: {
+          'cron-secondary/m1': { provider: 'cron-secondary', model: 'm1', maxContextSize: 8192 },
+        },
+        defaultModel: 'cron-secondary/m1',
+      },
+    });
+    const created = await klient.global.sessions.create({
+      workDir: process.cwd(),
+      title: 'cron & secondary',
+    });
+    sessionId = created.id;
+  });
+
+  afterAll(async () => {
+    await klient.close();
+    engine.app.dispose();
+    await rm(engine.homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+  });
+
+  it('lists cron tasks with their next fire times', async () => {
+    const session = klient.session(sessionId);
+    expect((await session.getCronTasks()).tasks).toEqual([]);
+
+    const live = getLiveSessionById(engine.app.accessor, sessionId);
+    expect(live).toBeDefined();
+    const cron = live!.accessor.get(ISessionCronService);
+    const created = cron.addTask({ cron: '*/5 * * * *', prompt: 'ping', recurring: true });
+
+    const { tasks } = await session.getCronTasks();
+    const found = tasks.find((task) => task.id === created.id);
+    expect(found).toBeDefined();
+    expect(found!.cron).toBe('*/5 * * * *');
+    expect(found!.prompt).toBe('ping');
+    // A recurring every-5-minutes schedule always has a future fire.
+    expect(typeof found!.nextFireAt).toBe('number');
+  });
+
+  it('rejects applyPersistedSecondaryModel without a persisted recipe', async () => {
+    await expect(klient.session(sessionId).applyPersistedSecondaryModel()).rejects.toThrow(
+      /persist its recipe/,
+    );
+  });
+
+  it('rejects an unknown secondary model, then applies a configured one', async () => {
+    const session = klient.session(sessionId);
+    await klient.global.config.set({ domain: 'secondaryModel', patch: { model: 'no-such-model' } });
+    await expect(session.applyPersistedSecondaryModel()).rejects.toThrow(/not configured/);
+
+    await klient.global.config.set({
+      domain: 'secondaryModel',
+      patch: { model: 'cron-secondary/m1' },
+    });
+    await expect(session.applyPersistedSecondaryModel()).resolves.toBeUndefined();
   });
 });

@@ -33,6 +33,7 @@ import { providersContract } from './global/providers.js';
 import { sessionsContract } from './global/sessions.js';
 import { workspacesContract } from './global/workspaces.js';
 import { sessionApprovalContract } from './session/approval.js';
+import { sessionCronContract } from './session/cron.js';
 import { sessionBtwContract } from './session/btw.js';
 import { sessionInteractionContract } from './session/interaction.js';
 import {
@@ -68,6 +69,7 @@ export const globalContract: KlientContract = {
   sessionMetadata: sessionMetadataContract,
   sessionInteractionService: sessionInteractionContract,
   sessionApprovalService: sessionApprovalContract,
+  sessionCronService: sessionCronContract,
   sessionQuestionService: sessionQuestionContract,
   sessionSkillCatalog: sessionSkillCatalogContract,
   sessionBtwService: sessionBtwContract,
