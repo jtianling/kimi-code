@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -111,6 +111,7 @@ export async function executeTool<Input>(
 
 export async function startInProcessHttpMcpServer(opts?: {
   authToken?: string;
+  onRequest?: (req: IncomingMessage) => void;
 }): Promise<{ url: string; close: () => Promise<void> }> {
   const mcpServer = new McpServer({ name: 'mock-http', version: '0.0.1' });
   mcpServer.registerTool(
@@ -125,6 +126,7 @@ export async function startInProcessHttpMcpServer(opts?: {
   await mcpServer.connect(transport);
 
   const httpServer: Server = createServer((req, res) => {
+    opts?.onRequest?.(req);
     if (opts?.authToken !== undefined) {
       const auth = req.headers['authorization'];
       if (auth !== `Bearer ${opts.authToken}`) {

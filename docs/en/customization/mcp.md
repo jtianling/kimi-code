@@ -49,17 +49,20 @@ Optional fields:
 | --- | --- | --- | --- |
 | `env` | `Record<string, string>` | stdio | Environment variables injected into the child process |
 | `cwd` | `string` | stdio | Working directory for the child process |
-| `headers` | `Record<string, string>` | HTTP, SSE | Static request headers appended to every request |
+| `headers` | `Record<string, string>` | HTTP, SSE | Request headers appended to every request; values support `${VAR}` environment variable templates |
 | `bearerTokenEnvVar` | `string` | HTTP, SSE | Name of an environment variable that contains a bearer token |
 | `enabled` | `boolean` | All | Set to `false` to disable this server |
 | `startupTimeoutMs` | `number` | All | Connection timeout from `1` to `2147483647` milliseconds; default `30000` |
 | `toolTimeoutMs` | `number` | All | Timeout from `1` to `2147483647` milliseconds for a single tool call |
 | `enabledTools` | `string[]` | All | Tool allowlist |
 | `disabledTools` | `string[]` | All | Tool blocklist |
+| `scope` | `"workspace" \| "session"` | All | Connection isolation. `"workspace"` (default) shares one connection across all sessions in the workspace; `"session"` opens a separate connection per session |
+
+Set `scope` to `"session"` for servers that bind per-connection state or identity (for example, a collaboration server that treats each connection as a distinct client), so concurrent sessions do not interfere with each other.
 
 You do not have to set the connection timeout or the single tool-call timeout per server: `[mcp] startup_timeout_ms` / `[mcp] tool_timeout_ms` in `config.toml` or the `KIMI_MCP_STARTUP_TIMEOUT_MS` / `KIMI_MCP_TOOL_TIMEOUT_MS` environment variables change the global defaults. Precedence is: per-server field > environment variable > `config.toml` > built-in default. See [Configuration files](../configuration/config-files.md#mcp).
 
-HTTP and SSE servers support providing static credentials via `headers` or `bearerTokenEnvVar`. When OAuth is needed, run `/mcp-config login <server-name>` to complete browser-based authorization.
+HTTP and SSE servers support providing static credentials via `headers` or `bearerTokenEnvVar`. In `headers` values, `${VAR}` expands to the environment variable of that name; if any variable in a value is unset or empty, that header is omitted. Session-scoped connections (`scope: "session"`) can additionally resolve per-session variables such as `KIMI_XATS_SESSION_ID`. When OAuth is needed, run `/mcp-config login <server-name>` to complete browser-based authorization.
 
 Plugins can also declare MCP servers in their manifest. Servers declared by a plugin are enabled by default and can be disabled or re-enabled in `/plugins`, then a new session must be started. See [Plugins](./plugins.md) for details.
 

@@ -375,6 +375,13 @@ function workspaceMcpServiceStub(ready: Promise<void> = Promise.resolve()): IWor
         throw new Error('not implemented');
       },
     }),
+    sessionServersData: () => ({
+      _serviceBrand: undefined,
+      ready: Promise.resolve(),
+      servers: () => ({}),
+      tunables: () => ({}),
+      onDidChange: () => ({ dispose: () => {} }),
+    }),
   };
 }
 

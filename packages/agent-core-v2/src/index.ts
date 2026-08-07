@@ -321,6 +321,9 @@ export * from '#/session/agentLifecycle/agentLifecycle';
 export * from '#/session/agentLifecycle/agentLifecycleService';
 export * from '#/session/agentLifecycle/mainAgent';
 export * from '#/session/mcp/sessionMcpHandle';
+export * from '#/session/sessionMcp/sessionMcpServers';
+export * from '#/session/sessionMcp/sessionMcp';
+export * from '#/session/sessionMcp/sessionMcpService';
 import '#/app/mcpConfig/configSection';
 export {
   MCP_SECTION,

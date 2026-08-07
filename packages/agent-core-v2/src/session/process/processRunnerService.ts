@@ -3,10 +3,10 @@
  *
  * Resolves the default cwd from the session's `ISessionContext` and delegates
  * the actual host spawn to the App-scope `IHostProcessService`. A per-call
- * `options.cwd` wins over the seeded cwd. A per-call `options.env` is overlaid
- * onto `process.env` and passed as the child's complete env bag (the host
- * replaces the child env with what we pass); when `options.env` is omitted we
- * pass `undefined` so the child inherits `process.env` verbatim.
+ * `options.cwd` wins over the seeded cwd. The child env is `process.env` plus
+ * the per-session overlay (`sessionProcessEnv`), with a per-call
+ * `options.env` overlaid on top (the host replaces the child env with what we
+ * pass).
  *
  * This Session-scope registration is the DEFAULT for scopes built without a
  * workspace handler (test hosts, harness agents). Real sessions get the
@@ -20,6 +20,7 @@ import { IHostProcessService } from '#/os/interface/hostProcess';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 
 import { type IProcess, ISessionProcessRunner, type ProcessExecOptions } from './processRunner';
+import { sessionProcessEnv } from './sessionProcessEnv';
 
 export class SessionProcessRunner implements ISessionProcessRunner {
   declare readonly _serviceBrand: undefined;
@@ -44,14 +45,10 @@ export class SessionProcessRunner implements ISessionProcessRunner {
     return this.hostProcess.spawn(command, restArgs, { cwd, env });
   }
 
-  private _buildExecEnv(
-    invocationEnv: Record<string, string> | undefined,
-  ): Record<string, string> | undefined {
-    if (invocationEnv === undefined) {
-      return undefined;
-    }
+  private _buildExecEnv(invocationEnv: Record<string, string> | undefined): Record<string, string> {
     return {
       ...(process.env as Record<string, string>),
+      ...sessionProcessEnv(this.ctx.sessionId),
       ...invocationEnv,
     };
   }

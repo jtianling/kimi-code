@@ -86,6 +86,7 @@ import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStor
 import { IAgentLifecycleService, MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
 import { ensureMainAgent } from '#/session/agentLifecycle/mainAgent';
 import { sessionMcpHandleSeed } from '#/session/mcp/sessionMcpHandle';
+import { sessionMcpServersSeed } from '#/session/sessionMcp/sessionMcpServers';
 import { labelsFromAgentMeta } from '#/session/agentLifecycle/subagentMetadata';
 import { ISessionContext, sessionContextSeed } from '#/session/sessionContext/sessionContext';
 import { sessionAgentProfileCatalogSeed } from '#/session/sessionAgentProfileCatalog/agentProfileCatalogSeed';
@@ -98,6 +99,10 @@ import {
 } from '#/session/sessionLifecycleHooks/sessionLifecycleHooks';
 import { ISessionMetadata, type SessionMeta } from '#/session/sessionMetadata/sessionMetadata';
 import { ISessionProcessRunner } from '#/session/process/processRunner';
+import {
+  SessionEnvProcessRunner,
+  sessionProcessEnv,
+} from '#/session/process/sessionProcessEnv';
 import { sessionSkillCatalogDataSeed } from '#/session/sessionSkillCatalog/skillCatalogData';
 import { ISessionToolPolicy } from '#/session/sessionToolPolicy/sessionToolPolicy';
 import { sessionToolPolicyGateSeed } from '#/session/sessionToolPolicyGate/sessionToolPolicyGate';
@@ -263,9 +268,16 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
           }),
           ...sessionInstructionsProviderSeed(this.instructions.sessionProvider()),
           ...sessionMcpHandleSeed(this.mcp.sessionHandle()),
+          ...sessionMcpServersSeed(this.mcp.sessionServersData()),
           ...sessionWorkspaceInfoSeed(this.workspaceDirs.sessionInfo()),
           ...sessionToolPolicyGateSeed(this.toolPolicy.sessionGate()),
-          [ISessionProcessRunner, this.processRunner],
+          // Wrap the handler-shared runner so every spawned tool process
+          // carries this session's env overlay (KIMI_XATS_SESSION_ID — see
+          // session/process/sessionProcessEnv.ts).
+          [
+            ISessionProcessRunner,
+            new SessionEnvProcessRunner(this.processRunner, sessionProcessEnv(opts.sessionId)),
+          ],
         ],
       },
     ) as ISessionScopeHandle;

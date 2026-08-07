@@ -26,6 +26,7 @@ import { CronTaskPersistenceService } from '#/app/cron/cronTaskPersistenceServic
 import { IAgentGoalService } from '#/agent/goal/goal';
 import { AgentGoalService } from '#/agent/goal/goalService';
 import { ISessionMcpHandle } from '#/session/mcp/sessionMcpHandle';
+import { ISessionMcpService } from '#/session/sessionMcp/sessionMcp';
 import { ISessionWorkspaceInfo } from '#/session/workspaceInfo/workspaceInfo';
 import { McpConnectionManager } from '#/mcpCore/connection-manager';
 import { loadAgentsMdForRoots, type LoadedAgentsMd } from '#/agent/profile/context';
@@ -693,14 +694,23 @@ export function cronServices(): TestAgentServiceOverride {
 
 export function mcpServices(options: {
   readonly manager?: McpConnectionManager;
+  readonly sessionManager?: McpConnectionManager;
 }): TestAgentServiceOverride {
   // `AgentMcpService` resolves the workspace's shared manager through the
-  // seeded `ISessionMcpHandle`; tests inject a fake manager by stubbing it.
-  return sessionService(ISessionMcpHandle, {
-    _serviceBrand: undefined,
-    ready: Promise.resolve(),
-    connectionManager: options.manager!,
-  } satisfies ISessionMcpHandle);
+  // seeded `ISessionMcpHandle` and the per-session manager through
+  // `ISessionMcpService`; tests inject fake managers by stubbing both.
+  return [
+    sessionService(ISessionMcpHandle, {
+      _serviceBrand: undefined,
+      ready: Promise.resolve(),
+      connectionManager: options.manager!,
+    } satisfies ISessionMcpHandle),
+    sessionService(ISessionMcpService, {
+      _serviceBrand: undefined,
+      ready: Promise.resolve(),
+      connectionManager: options.sessionManager ?? new McpConnectionManager(),
+    } satisfies ISessionMcpService),
+  ];
 }
 
 export function skillServices(
@@ -1206,6 +1216,11 @@ export class AgentTestContext {
               ready: Promise.resolve(),
               connectionManager: new McpConnectionManager(),
             } satisfies ISessionMcpHandle);
+            reg.defineInstance(ISessionMcpService, {
+              _serviceBrand: undefined,
+              ready: Promise.resolve(),
+              connectionManager: new McpConnectionManager(),
+            } satisfies ISessionMcpService);
             reg.defineInstance(ISessionWorkspaceInfo, {
               _serviceBrand: undefined,
               ready: Promise.resolve(),

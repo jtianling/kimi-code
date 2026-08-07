@@ -49,17 +49,20 @@ MCP server 配置写在 `mcp.json` 中，分两层：
 | --- | --- | --- | --- |
 | `env` | `Record<string, string>` | stdio | 注入子进程的环境变量 |
 | `cwd` | `string` | stdio | 子进程工作目录 |
-| `headers` | `Record<string, string>` | HTTP、SSE | 附加到每次请求的静态请求头 |
+| `headers` | `Record<string, string>` | HTTP、SSE | 附加到每次请求的请求头；值支持 `${VAR}` 环境变量模板 |
 | `bearerTokenEnvVar` | `string` | HTTP、SSE | 存放 bearer token 的环境变量名 |
 | `enabled` | `boolean` | 全部 | 设为 `false` 可禁用该 server |
 | `startupTimeoutMs` | `number` | 全部 | 连接超时，取值范围为 `1` 到 `2147483647` 毫秒，默认 `30000` |
 | `toolTimeoutMs` | `number` | 全部 | 单次工具调用超时，取值范围为 `1` 到 `2147483647` 毫秒 |
 | `enabledTools` | `string[]` | 全部 | 工具白名单 |
 | `disabledTools` | `string[]` | 全部 | 工具黑名单 |
+| `scope` | `"workspace" \| "session"` | 全部 | 连接隔离。`"workspace"`（默认）在同一 workspace 的所有 session 间共享一条连接；`"session"` 为每个 session 单独建立连接 |
+
+对按连接绑定状态或身份的 server（例如把每条连接视为独立客户端的协作 server），将 `scope` 设为 `"session"`，避免并发的 session 互相干扰。
 
 连接超时和单次工具调用超时的默认值都不必逐个 server 设置：`config.toml` 的 `[mcp] startup_timeout_ms` / `[mcp] tool_timeout_ms` 或环境变量 `KIMI_MCP_STARTUP_TIMEOUT_MS` / `KIMI_MCP_TOOL_TIMEOUT_MS` 可以调整全局默认值，优先级为 server 字段 > 环境变量 > `config.toml` > 内置默认。详见 [配置文件](../configuration/config-files.md#mcp)。
 
-HTTP 与 SSE server 支持通过 `headers` 或 `bearerTokenEnvVar` 提供静态凭证。需要 OAuth 时，运行 `/mcp-config login <server-name>` 完成浏览器授权。
+HTTP 与 SSE server 支持通过 `headers` 或 `bearerTokenEnvVar` 提供静态凭证。`headers` 值中的 `${VAR}` 会展开为同名环境变量；若值中任一变量未设置或为空，该请求头会被省略。session 级连接（`scope: "session"`）还可以解析 `KIMI_XATS_SESSION_ID` 这类 per-session 变量。需要 OAuth 时，运行 `/mcp-config login <server-name>` 完成浏览器授权。
 
 Plugins 也可以在 manifest 中声明 MCP servers。Plugin 声明的 servers 默认启用，可以在 `/plugins` 中禁用或重新启用，然后开启新会话。详见 [Plugins](./plugins.md)。
 

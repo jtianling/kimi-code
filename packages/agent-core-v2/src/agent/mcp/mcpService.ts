@@ -1,15 +1,20 @@
 /**
  * `mcp` domain — `IAgentMcpService` implementation.
  *
- * Mirrors the workspace-level shared MCP connection manager's server set
- * into the agent's tool registry (the manager arrives through the seeded
+ * Mirrors TWO connection managers' server sets into the agent's tool
+ * registry: the workspace-level shared manager (arriving through the seeded
  * `ISessionMcpHandle` — one manager per workspace handler, shared by every
- * session and agent): registers qualified tools for connected servers,
- * keeps them registered across reconnects, swaps in the OAuth tool for
+ * session and agent) and the session-level per-session manager (the
+ * `sessionMcp` domain's `ISessionMcpService`, holding the servers that
+ * declared `scope: 'session'`; the two sets are name-disjoint by
+ * configuration). Registers qualified tools for connected servers, keeps
+ * them registered across reconnects, swaps in the OAuth tool for
  * `needs-auth` servers, journals tool discoveries on the wire (queued until
  * restore finishes), and publishes `mcp.server.status` / `tool.list.updated`
- * events. The plain-data state (`mcpToolsByServer`, `discoveryWritesReady`)
- * is registered into `agentState` (`IAgentStateService`) and read/written
+ * events. Reads (`list` / `resolved` / `getRemoteServerUrl`) merge both
+ * managers; `reconnect` routes to the manager that owns the server. The
+ * plain-data state (`mcpToolsByServer`, `discoveryWritesReady`) is
+ * registered into `agentState` (`IAgentStateService`) and read/written
  * through it; `mcpTools` stays a plain instance field (its values hold
  * disposable resource handles, not plain data), as does `pendingDiscoveries`
  * (a closure queue of deferred discovery writes). Bound at Agent scope.
@@ -35,7 +40,8 @@ import { createMcpAuthTool } from '#/agent/mcp/tools/auth';
 import { createMcpTool } from '#/agent/mcp/tools/mcp';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionMcpHandle } from '#/session/mcp/sessionMcpHandle';
-import type { McpServerEntry } from '#/mcpCore/connection-manager';
+import { ISessionMcpService } from '#/session/sessionMcp/sessionMcp';
+import type { McpConnectionManager, McpServerEntry } from '#/mcpCore/connection-manager';
 import { IAgentMcpService } from './mcp';
 import { qualifyMcpToolName } from '#/mcpCore/tool-naming';
 import type { MCPClient, MCPToolDefinition } from '#/mcpCore/types';
@@ -100,6 +106,7 @@ export class AgentMcpService extends Disposable implements IAgentMcpService {
 
   constructor(
     @ISessionMcpHandle private readonly mcpHandle: ISessionMcpHandle,
+    @ISessionMcpService private readonly sessionMcp: ISessionMcpService,
     @ISessionContext private readonly sessionContext: ISessionContext,
     @IAgentToolRegistryService private readonly registry: IAgentToolRegistryService,
     @IEventBus private readonly eventBus: IEventBus,
@@ -141,29 +148,55 @@ export class AgentMcpService extends Disposable implements IAgentMcpService {
     return this.mcpHandle.connectionManager.oauthService;
   }
 
-  waitForInitialLoad(signal?: AbortSignal): Promise<void> {
-    return this.mcpHandle.connectionManager.waitForInitialLoad(signal);
+  private get workspaceManager(): McpConnectionManager {
+    return this.mcpHandle.connectionManager;
+  }
+
+  private get sessionManager(): McpConnectionManager {
+    return this.sessionMcp.connectionManager;
+  }
+
+  private managers(): readonly McpConnectionManager[] {
+    return [this.workspaceManager, this.sessionManager];
+  }
+
+  private owningManager(name: string): McpConnectionManager {
+    return this.sessionManager.get(name) !== undefined
+      ? this.sessionManager
+      : this.workspaceManager;
+  }
+
+  async waitForInitialLoad(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    // The session manager's connectAll is only issued once the seeded server
+    // set resolves, so gate on the service readiness before reading the
+    // manager-level initial-load promises.
+    await this.sessionMcp.ready;
+    await Promise.all(this.managers().map((manager) => manager.waitForInitialLoad(signal)));
   }
 
   initialLoadDurationMs(): number {
-    return this.mcpHandle.connectionManager.initialLoadDurationMs();
+    return Math.max(...this.managers().map((manager) => manager.initialLoadDurationMs()));
   }
 
   list() {
-    return this.mcpHandle.connectionManager.list();
+    return [...this.workspaceManager.list(), ...this.sessionManager.list()];
   }
 
   resolved(name: string) {
-    return this.mcpHandle.connectionManager.resolved(name);
+    return this.workspaceManager.resolved(name) ?? this.sessionManager.resolved(name);
   }
 
   getRemoteServerUrl(name: string) {
-    return this.mcpHandle.connectionManager.getRemoteServerUrl(name);
+    return (
+      this.workspaceManager.getRemoteServerUrl(name) ??
+      this.sessionManager.getRemoteServerUrl(name)
+    );
   }
 
   async reconnect(name: string, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
-    await this.mcpHandle.connectionManager.reconnect(name);
+    await this.owningManager(name).reconnect(name);
     signal?.throwIfAborted();
   }
 
@@ -182,15 +215,17 @@ export class AgentMcpService extends Disposable implements IAgentMcpService {
   ): Promise<MCPClient | undefined> {
     const healed = this.resolved(serverName)?.client;
     if (healed !== undefined && healed !== staleClient) return healed;
-    await this.mcpHandle.connectionManager.reconnectAndJoin(serverName);
+    await this.owningManager(serverName).reconnectAndJoin(serverName);
     const current = this.resolved(serverName)?.client;
     return current !== undefined && current !== staleClient ? current : undefined;
   }
 
   onStatusChange(listener: Parameters<IAgentMcpService['onStatusChange']>[0]) {
-    const unsubscribe = this.mcpHandle.connectionManager.onStatusChange(listener);
+    const unsubscribes = this.managers().map((manager) => manager.onStatusChange(listener));
     return {
-      dispose: unsubscribe,
+      dispose: () => {
+        for (const unsubscribe of unsubscribes) unsubscribe();
+      },
     };
   }
 

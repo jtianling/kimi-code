@@ -3,7 +3,10 @@
  *
  * Owns the `McpServerConfig` schema and its transport variants. These describe
  * the shape of MCP server entries as they appear in configuration (whether in
- * `config.toml` or an MCP-specific config file).
+ * `config.toml` or an MCP-specific config file). The optional `scope` field
+ * selects the connection lifetime: `'workspace'` (the default) shares one
+ * connection across every session of the workspace; `'session'` opts the
+ * server into per-session connections owned by the `sessionMcp` domain.
  */
 
 import { z } from 'zod';
@@ -15,6 +18,7 @@ export const McpTimeoutMsSchema = z.number().int().min(1).max(MAX_MCP_TIMEOUT_MS
 
 const McpServerCommonFields = {
   enabled: z.boolean().optional(),
+  scope: z.enum(['workspace', 'session']).optional(),
   startupTimeoutMs: McpTimeoutMsSchema.optional(),
   toolTimeoutMs: McpTimeoutMsSchema.optional(),
   enabledTools: z.array(z.string()).optional(),

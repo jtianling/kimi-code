@@ -14,8 +14,13 @@ import {
 import { createScopedTestHost, stubPair } from '#/_base/di/test';
 import { IHostProcessService } from '#/os/interface/hostProcess';
 import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
-import { ISessionProcessRunner } from '#/session/process/processRunner';
+import {
+  type IProcess,
+  ISessionProcessRunner,
+  type ProcessExecOptions,
+} from '#/session/process/processRunner';
 import { SessionProcessRunner } from '#/session/process/processRunnerService';
+import { SessionEnvProcessRunner } from '#/session/process/sessionProcessEnv';
 import { ISessionContext, makeSessionContext } from '#/session/sessionContext/sessionContext';
 
 async function collect(stream: Readable): Promise<string> {
@@ -91,5 +96,50 @@ describe('SessionProcessRunner', () => {
     const out = await collect(proc.stdout);
     expect(out).toBe('bar');
     expect(await proc.wait()).toBe(0);
+  });
+
+  it('exec binds KIMI_XATS_SESSION_ID to the owning session', async () => {
+    const runner = await makeRunner();
+    const proc = await runner.exec([
+      'node',
+      '-e',
+      'process.stdout.write(process.env.KIMI_XATS_SESSION_ID ?? "")',
+    ]);
+    const out = await collect(proc.stdout);
+    expect(out).toBe('s');
+    expect(await proc.wait()).toBe(0);
+  });
+
+  it('exec lets a per-call env override the session overlay', async () => {
+    const runner = await makeRunner();
+    const proc = await runner.exec(
+      ['node', '-e', 'process.stdout.write(process.env.KIMI_XATS_SESSION_ID ?? "")'],
+      { env: { KIMI_XATS_SESSION_ID: 'other' } },
+    );
+    const out = await collect(proc.stdout);
+    expect(out).toBe('other');
+    expect(await proc.wait()).toBe(0);
+  });
+});
+
+describe('SessionEnvProcessRunner', () => {
+  function fakeInner(): ISessionProcessRunner & { seen?: ProcessExecOptions } {
+    const inner: ISessionProcessRunner & { seen?: ProcessExecOptions } = {
+      _serviceBrand: undefined,
+      exec: (_args, options) => {
+        inner.seen = options;
+        return Promise.resolve({} as IProcess);
+      },
+    };
+    return inner;
+  }
+
+  it('overlays its env bag onto every exec, per-call env wins', async () => {
+    const inner = fakeInner();
+    const runner = new SessionEnvProcessRunner(inner, { KIMI_XATS_SESSION_ID: 's' });
+    await runner.exec(['true']);
+    expect(inner.seen?.env).toEqual({ KIMI_XATS_SESSION_ID: 's' });
+    await runner.exec(['true'], { env: { KIMI_XATS_SESSION_ID: 'x', FOO: '1' } });
+    expect(inner.seen?.env).toEqual({ KIMI_XATS_SESSION_ID: 'x', FOO: '1' });
   });
 });

@@ -184,6 +184,13 @@ function workspaceMcpStub(): IWorkspaceMcpService {
         throw new Error('not implemented');
       },
     }),
+    sessionServersData: () => ({
+      _serviceBrand: undefined,
+      ready: Promise.resolve(),
+      servers: () => ({}),
+      tunables: () => ({}),
+      onDidChange: Event.None,
+    }),
   } as unknown as IWorkspaceMcpService;
 }
 

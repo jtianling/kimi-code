@@ -26,6 +26,7 @@ import { IAgentLifecycleService } from '#/session/agentLifecycle/agentLifecycle'
 import { AgentLifecycleService } from '#/session/agentLifecycle/agentLifecycleService';
 import { ensureMainAgent } from '#/session/agentLifecycle/mainAgent';
 import { ISessionMcpHandle } from '#/session/mcp/sessionMcpHandle';
+import { ISessionMcpService } from '#/session/sessionMcp/sessionMcp';
 import { ISessionInstructionsProvider } from '#/session/sessionInstructions/instructionsProvider';
 import { McpOAuthService } from '#/mcpCore/oauth/service';
 import { createMcpOAuthStore } from '#/app/mcpConfig/oauthStore';
@@ -361,6 +362,13 @@ describe('AgentLifecycleService', () => {
         oauthService: new McpOAuthService({ store: createMcpOAuthStore(atomicDocsStore) }),
       }),
     } satisfies ISessionMcpHandle);
+    // The per-session manager the dual-manager `AgentMcpService` also
+    // consumes: empty by default (no `scope: 'session'` servers in play).
+    ix.stub(ISessionMcpService, {
+      _serviceBrand: undefined,
+      ready: Promise.resolve(),
+      connectionManager: new McpConnectionManager({ log: noopLog }),
+    } satisfies ISessionMcpService);
     stopAllOnExit = vi.fn(async () => []);
     ix.stub(IAgentTaskService, {
       _serviceBrand: undefined,

@@ -40,6 +40,10 @@ function stdioServer(): McpServerConfig {
   return { transport: 'stdio', command: process.execPath, args: [stdioFixture] };
 }
 
+function sessionStdioServer(): McpServerConfig {
+  return { ...stdioServer(), scope: 'session' };
+}
+
 describe('WorkspaceMcpService', () => {
   let cwd: string;
   let disposables: DisposableStore;
@@ -168,5 +172,92 @@ describe('WorkspaceMcpService', () => {
       },
       { timeout: 10000, interval: 50 },
     );
+  }, 20000);
+
+  it('keeps session-scoped servers out of the shared manager at initial load', async () => {
+    current = { alpha: stdioServer(), perSession: sessionStdioServer() };
+    const connectAll = vi
+      .spyOn(McpConnectionManager.prototype, 'connectAll')
+      .mockResolvedValue(undefined);
+
+    const service = createService();
+    manager = service.connectionManager();
+    await service.ready;
+
+    expect(connectAll).toHaveBeenCalledTimes(1);
+    expect(Object.keys(connectAll.mock.calls[0]?.[0] ?? {})).toEqual(['alpha']);
+  });
+
+  it('drops a server from the shared manager when its scope flips to session', async () => {
+    current = { alpha: stdioServer() };
+    const service = createService();
+    manager = service.connectionManager();
+    await service.ready;
+    expect(manager.get('alpha')?.status).toBe('connected');
+
+    configChanges.fire({ upsert: { alpha: sessionStdioServer() }, remove: [] });
+
+    await vi.waitFor(
+      () => {
+        expect(manager?.get('alpha')).toBeUndefined();
+      },
+      { timeout: 10000, interval: 50 },
+    );
+  }, 20000);
+
+  it('connects a server when its scope flips from session back to workspace', async () => {
+    current = { alpha: sessionStdioServer() };
+    const service = createService();
+    manager = service.connectionManager();
+    await service.ready;
+    expect(manager.get('alpha')).toBeUndefined();
+
+    configChanges.fire({ upsert: { alpha: stdioServer() }, remove: [] });
+
+    await vi.waitFor(
+      () => {
+        expect(manager?.get('alpha')?.status).toBe('connected');
+      },
+      { timeout: 10000, interval: 50 },
+    );
+  }, 20000);
+
+  it('projects only session-scoped servers through sessionServersData', async () => {
+    current = { alpha: stdioServer(), perSession: sessionStdioServer() };
+    const service = createService();
+    manager = service.connectionManager();
+    await service.ready;
+
+    const data = service.sessionServersData();
+    expect(Object.keys(data.servers())).toEqual(['perSession']);
+
+    const changes: McpServersChange[] = [];
+    data.onDidChange((change) => changes.push(change));
+
+    // Workspace-scoped upserts never reach the projection as upserts; they
+    // are translated into removals (harmless no-ops for names the session
+    // manager never had, and the drop signal for a scope flip away).
+    configChanges.fire({
+      upsert: { alpha: stdioServer(), perSession: stdioServer() },
+      remove: [],
+    });
+    await vi.waitFor(
+      () => {
+        expect(changes).toEqual([{ upsert: {}, remove: ['alpha', 'perSession'] }]);
+      },
+      { timeout: 10000, interval: 50 },
+    );
+
+    // Session-scoped upserts and removals pass through.
+    configChanges.fire({ upsert: { perSession: sessionStdioServer() }, remove: [] });
+    configChanges.fire({ upsert: {}, remove: ['perSession'] });
+    await vi.waitFor(
+      () => {
+        expect(changes).toHaveLength(3);
+      },
+      { timeout: 10000, interval: 50 },
+    );
+    expect(changes[1]).toEqual({ upsert: { perSession: sessionStdioServer() }, remove: [] });
+    expect(changes[2]).toEqual({ upsert: {}, remove: ['perSession'] });
   }, 20000);
 });

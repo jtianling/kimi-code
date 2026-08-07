@@ -2,10 +2,13 @@
  * `mcp` domain — seeded MCP shared-handle contract.
  *
  * Defines `ISessionMcpHandle`, the pure-data injection contract carrying the
- * workspace handler's one shared `McpConnectionManager` (all sessions of the
- * workspace connect through the same manager — no per-session connections
- * exist) plus the initial-connect readiness promise. The contract carries no
- * IO of its own. Session-scoped.
+ * workspace handler's one shared `McpConnectionManager` (servers with the
+ * default `scope: 'workspace'` — all sessions of the workspace connect
+ * through the same manager) plus the initial-connect readiness promise.
+ * Servers that declare `scope: 'session'` are NOT in this manager: they get
+ * per-session connections from the `sessionMcp` domain's
+ * `ISessionMcpService`, seeded alongside via `ISessionMcpServers`. The
+ * contract carries no IO of its own. Session-scoped.
  */
 
 import { createDecorator, type ServiceIdentifier } from '#/_base/di/instantiation';

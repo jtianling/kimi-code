@@ -1,0 +1,264 @@
+/**
+ * Scenario: per-session MCP connections — the Session-scope `SessionMcpService`
+ * owns a private `McpConnectionManager` fed by the seeded `ISessionMcpServers`
+ * projection: the initial connect consumes its snapshot, filtered change
+ * events are applied incrementally after the initial connect settles, and
+ * disposing the session service shuts the connections down.
+ *
+ * Exercises the real `SessionMcpService` against a stubbed
+ * `ISessionMcpServers` seed and an in-process HTTP MCP server. Run:
+ * `pnpm --filter @moonshot-ai/agent-core-v2 exec vitest run
+ * test/session/sessionMcp/sessionMcp.test.ts`.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { DisposableStore } from '#/_base/di/lifecycle';
+import {
+  LifecycleScope,
+  ScopeActivation,
+  _clearScopedRegistryForTests,
+  registerScopedService,
+} from '#/_base/di/scope';
+import { createScopedTestHost, createServices, stubPair } from '#/_base/di/test';
+import { Emitter } from '#/_base/event';
+import { ILogService } from '#/_base/log/log';
+import { IMcpOAuthStore } from '#/app/mcpConfig/oauthStore';
+import type { McpServerConfig } from '#/mcpCore/config-schema';
+import { ISessionContext } from '#/session/sessionContext/sessionContext';
+import { ISessionMcpService } from '#/session/sessionMcp/sessionMcp';
+import { SessionMcpService } from '#/session/sessionMcp/sessionMcpService';
+import { ISessionMcpServers } from '#/session/sessionMcp/sessionMcpServers';
+import type {
+  McpServersChange,
+  McpTunables,
+} from '#/workspace/workspaceMcpConfig/workspaceMcpConfig';
+
+import { stubLog } from '../../_base/log/stubs';
+import { createMemoryMcpOAuthStore, startInProcessHttpMcpServer } from '../../mcpCore/stubs';
+
+describe('SessionMcpService', () => {
+  let disposables: DisposableStore;
+  let httpServer: { url: string; close: () => Promise<void> } | undefined;
+  let current: Record<string, McpServerConfig>;
+  let tunablesValue: McpTunables;
+  let changes: Emitter<McpServersChange>;
+
+  beforeEach(() => {
+    disposables = new DisposableStore();
+    httpServer = undefined;
+    current = {};
+    tunablesValue = {};
+    changes = new Emitter<McpServersChange>();
+  });
+
+  afterEach(async () => {
+    disposables.dispose();
+    await httpServer?.close();
+  });
+
+  function httpServerConfig(): McpServerConfig {
+    if (httpServer === undefined) throw new Error('http server not started');
+    return { transport: 'http', url: httpServer.url, scope: 'session' };
+  }
+
+  function seedStub(): ISessionMcpServers {
+    return {
+      _serviceBrand: undefined,
+      ready: Promise.resolve(),
+      servers: () => current,
+      tunables: () => tunablesValue,
+      onDidChange: changes.event,
+    };
+  }
+
+  function sessionContextStub(): ISessionContext {
+    return {
+      _serviceBrand: undefined,
+      sessionId: 'sess_test',
+      workspaceId: 'ws_test',
+      sessionDir: '/tmp/kimi-session-mcp-test',
+      metaScope: 'test',
+      cwd: '/tmp/kimi-session-mcp-test',
+      scope: (subKey?: string) => (subKey === undefined ? 'test' : `test/${subKey}`),
+    };
+  }
+
+  function createService(): ISessionMcpService {
+    const ix = createServices(disposables, {
+      strict: true,
+      additionalServices: (reg) => {
+        reg.defineInstance(ISessionContext, sessionContextStub());
+        reg.defineInstance(ISessionMcpServers, seedStub());
+        reg.definePartialInstance(IMcpOAuthStore, createMemoryMcpOAuthStore());
+        reg.defineInstance(ILogService, stubLog());
+        reg.define(ISessionMcpService, SessionMcpService);
+      },
+    });
+    return ix.get(ISessionMcpService);
+  }
+
+  it('idles with zero connections when the seed has no session-scoped servers', async () => {
+    const service = createService();
+    await service.ready;
+    expect(service.connectionManager.list()).toEqual([]);
+  });
+
+  it('connects the seeded session-scoped servers at initial load', async () => {
+    httpServer = await startInProcessHttpMcpServer();
+    current = { perSession: httpServerConfig() };
+
+    const service = createService();
+    await service.ready;
+
+    const entry = service.connectionManager.get('perSession');
+    expect(entry?.status).toBe('connected');
+    expect(entry?.toolCount).toBe(1);
+  }, 20000);
+
+  it('resolves remote header templates against the per-session env overlay', async () => {
+    const received: Array<Record<string, string | string[] | undefined>> = [];
+    httpServer = await startInProcessHttpMcpServer({
+      onRequest: (req) => received.push(req.headers),
+    });
+    const stale = process.env['KIMI_XATS_SESSION_ID'];
+    process.env['KIMI_XATS_SESSION_ID'] = 'stale_session';
+    try {
+      if (httpServer === undefined) throw new Error('http server not started');
+      current = {
+        perSession: {
+          transport: 'http',
+          url: httpServer.url,
+          scope: 'session',
+          headers: {
+            'X-Kimi-Session-Id': '${KIMI_XATS_SESSION_ID}',
+            'X-Static': 'keep',
+            'X-Missing': '${KIMI_TEST_DEFINITELY_MISSING}',
+          },
+        },
+      };
+
+      const service = createService();
+      await service.ready;
+      expect(service.connectionManager.get('perSession')?.status).toBe('connected');
+
+      const hit = received.find((headers) => headers['x-static'] !== undefined);
+      expect(hit?.['x-kimi-session-id']).toBe('sess_test');
+      expect(hit?.['x-static']).toBe('keep');
+      expect(hit?.['x-missing']).toBeUndefined();
+    } finally {
+      if (stale === undefined) delete process.env['KIMI_XATS_SESSION_ID'];
+      else process.env['KIMI_XATS_SESSION_ID'] = stale;
+    }
+  }, 20000);
+
+  it('reads timeout tunables from the seed at connect', async () => {
+    httpServer = await startInProcessHttpMcpServer();
+    tunablesValue = { startupTimeoutMs: 4321, toolTimeoutMs: 9876 };
+    const tunables = vi.fn(() => tunablesValue);
+    current = { perSession: httpServerConfig() };
+
+    const ix = createServices(disposables, {
+      strict: true,
+      additionalServices: (reg) => {
+        reg.defineInstance(ISessionContext, sessionContextStub());
+        reg.defineInstance(ISessionMcpServers, { ...seedStub(), tunables });
+        reg.definePartialInstance(IMcpOAuthStore, createMemoryMcpOAuthStore());
+        reg.defineInstance(ILogService, stubLog());
+        reg.define(ISessionMcpService, SessionMcpService);
+      },
+    });
+    const service = ix.get(ISessionMcpService);
+    await service.ready;
+
+    expect(service.connectionManager.get('perSession')?.status).toBe('connected');
+    expect(tunables).toHaveBeenCalled();
+  }, 20000);
+
+  it('applies upserts and removals from the seed change events', async () => {
+    httpServer = await startInProcessHttpMcpServer();
+    const service = createService();
+    await service.ready;
+    expect(service.connectionManager.list()).toEqual([]);
+
+    changes.fire({ upsert: { perSession: httpServerConfig() }, remove: [] });
+    await vi.waitFor(
+      () => {
+        expect(service.connectionManager.get('perSession')?.status).toBe('connected');
+      },
+      { timeout: 10000, interval: 50 },
+    );
+
+    changes.fire({ upsert: {}, remove: ['perSession'] });
+    await vi.waitFor(
+      () => {
+        expect(service.connectionManager.get('perSession')).toBeUndefined();
+      },
+      { timeout: 10000, interval: 50 },
+    );
+  }, 20000);
+
+  it('shuts the connections down when the session service is disposed', async () => {
+    httpServer = await startInProcessHttpMcpServer();
+    current = { perSession: httpServerConfig() };
+    const service = createService();
+    await service.ready;
+    expect(service.connectionManager.get('perSession')?.status).toBe('connected');
+
+    disposables.dispose();
+
+    await vi.waitFor(
+      () => {
+        expect(service.connectionManager.list()).toEqual([]);
+      },
+      { timeout: 10000, interval: 50 },
+    );
+    disposables = new DisposableStore();
+  }, 20000);
+});
+
+describe('SessionMcpService (scoped)', () => {
+  beforeEach(() => {
+    _clearScopedRegistryForTests();
+    registerScopedService(
+      LifecycleScope.Session,
+      ISessionMcpService,
+      SessionMcpService,
+      ScopeActivation.OnScopeCreated,
+      'sessionMcp',
+    );
+  });
+
+  it('resolves from the Session scope with the seed and ancestor deps injected', async () => {
+    const changes = new Emitter<McpServersChange>();
+    const host = createScopedTestHost([
+      stubPair(ILogService, stubLog()),
+      stubPair(IMcpOAuthStore, createMemoryMcpOAuthStore() as IMcpOAuthStore),
+    ]);
+    try {
+      const session = host.child(LifecycleScope.Session, 'sess_test', [
+        stubPair(ISessionContext, {
+          _serviceBrand: undefined,
+          sessionId: 'sess_test',
+          workspaceId: 'ws_test',
+          sessionDir: '/tmp/kimi-session-mcp-test',
+          metaScope: 'test',
+          cwd: '/tmp/kimi-session-mcp-test',
+          scope: (subKey?: string) => (subKey === undefined ? 'test' : `test/${subKey}`),
+        }),
+        stubPair(ISessionMcpServers, {
+          _serviceBrand: undefined,
+          ready: Promise.resolve(),
+          servers: () => ({}),
+          tunables: () => ({}),
+          onDidChange: changes.event,
+        }),
+      ]);
+      const service = session.accessor.get(ISessionMcpService);
+      await service.ready;
+      expect(service.connectionManager.list()).toEqual([]);
+    } finally {
+      host.dispose();
+    }
+  });
+});

@@ -40,6 +40,58 @@ describe('buildMcpHttpHeaders', () => {
     ).toEqual({ 'X-Tenant': 'kimi' });
   });
 
+  it('expands ${VAR} templates in header values through the env lookup', () => {
+    expect(
+      buildMcpHttpHeaders(
+        {
+          transport: 'http',
+          url: 'https://x.example.com',
+          headers: { 'X-Session': '${SESSION_ID}', 'X-Trace': 't-${TRACE_ID}' },
+        },
+        (name) => new Map(Object.entries({ SESSION_ID: 'sess_1', TRACE_ID: 'abc' })).get(name),
+      ),
+    ).toEqual({ 'X-Session': 'sess_1', 'X-Trace': 't-abc' });
+  });
+
+  it('expands multiple variables in a single header value', () => {
+    expect(
+      buildMcpHttpHeaders(
+        {
+          transport: 'http',
+          url: 'https://x.example.com',
+          headers: { 'X-Pair': '${A}:${B}' },
+        },
+        (name) => new Map(Object.entries({ A: '1', B: '2' })).get(name),
+      ),
+    ).toEqual({ 'X-Pair': '1:2' });
+  });
+
+  it('omits a header when any template variable is missing or empty', () => {
+    const config = {
+      transport: 'http' as const,
+      url: 'https://x.example.com',
+      headers: { 'X-Session': '${MISSING}', 'X-Empty': '${EMPTY}', 'X-Static': 'keep' },
+    };
+    expect(buildMcpHttpHeaders(config, () => undefined)).toEqual({ 'X-Static': 'keep' });
+    expect(buildMcpHttpHeaders(config, (name) => (name === 'EMPTY' ? '' : undefined))).toEqual({
+      'X-Static': 'keep',
+    });
+  });
+
+  it('still injects the bearer token alongside templated headers', () => {
+    expect(
+      buildMcpHttpHeaders(
+        {
+          transport: 'http',
+          url: 'https://x.example.com',
+          headers: { 'X-Session': '${SESSION_ID}' },
+          bearerTokenEnvVar: 'TOK',
+        },
+        (name) => new Map(Object.entries({ SESSION_ID: 'sess_1', TOK: 'secret' })).get(name),
+      ),
+    ).toEqual({ 'X-Session': 'sess_1', Authorization: 'Bearer secret' });
+  });
+
   it('injects Authorization Bearer when env lookup yields a token', () => {
     expect(
       buildMcpHttpHeaders(

@@ -15,6 +15,7 @@ import type { McpConnectionManager, McpServerEntry } from '#/mcpCore/connection-
 import { IAgentMcpService } from '#/agent/mcp/mcp';
 import { AgentMcpService } from '#/agent/mcp/mcpService';
 import { ISessionMcpHandle } from '#/session/mcp/sessionMcpHandle';
+import { ISessionMcpService } from '#/session/sessionMcp/sessionMcp';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import type { McpOAuthService } from '#/mcpCore/oauth/service';
 import type { MCPClient, MCPToolDefinition } from '#/mcpCore/types';
@@ -62,6 +63,10 @@ class FakeMcpManager {
 
   list(): readonly McpServerEntry[] {
     return [...this.entries.values()];
+  }
+
+  get(name: string): McpServerEntry | undefined {
+    return this.entries.get(name);
   }
 
   resolved(name: string): ResolvedServer | undefined {
@@ -219,12 +224,17 @@ describe('AgentMcpService', () => {
     disposables.dispose();
   });
 
-  function createService(manager: FakeMcpManager): AgentMcpService {
+  function createService(manager: FakeMcpManager, sessionManager?: FakeMcpManager): AgentMcpService {
     ix.stub(ISessionMcpHandle, {
       _serviceBrand: undefined,
       ready: Promise.resolve(),
       connectionManager: manager as unknown as McpConnectionManager,
     } satisfies ISessionMcpHandle);
+    ix.stub(ISessionMcpService, {
+      _serviceBrand: undefined,
+      ready: Promise.resolve(),
+      connectionManager: (sessionManager ?? new FakeMcpManager()) as unknown as McpConnectionManager,
+    } satisfies ISessionMcpService);
     ix.stub(ISessionContext, { sessionDir: '/tmp/kimi-code-mcp-test' });
     const svc = ix.createInstance(AgentMcpService);
     disposables.add(svc);
@@ -247,6 +257,75 @@ describe('AgentMcpService', () => {
     manager.disconnect('s1');
     expect(svc.list().map((e) => e.name)).toEqual(['s2']);
     expect(statuses).toEqual(['s1:connected', 's2:connected', 's1:disabled']);
+  });
+
+  it('merges the workspace and session managers into list and tool registration', async () => {
+    const workspaceManager = new FakeMcpManager();
+    const sessionManager = new FakeMcpManager();
+    workspaceManager.setResolved('shared', fakeMcpClient(), await discoverTools(fakeMcpClient()));
+    sessionManager.setResolved('perSession', fakeMcpClient(), await discoverTools(fakeMcpClient()));
+    const svc = createService(workspaceManager, sessionManager);
+
+    workspaceManager.connect('shared');
+    sessionManager.connect('perSession');
+
+    expect(svc.list().map((entry) => entry.name).toSorted()).toEqual(['perSession', 'shared']);
+    const names = ix
+      .get(IAgentToolRegistryService)
+      .list()
+      .filter((tool) => tool.source === 'mcp')
+      .map((tool) => tool.name)
+      .toSorted();
+    expect(names).toEqual([
+      'mcp__perSession__echo',
+      'mcp__perSession__noop',
+      'mcp__shared__echo',
+      'mcp__shared__noop',
+    ]);
+    expect(svc.resolved('shared')?.client).toBe(workspaceManager.resolved('shared')?.client);
+    expect(svc.resolved('perSession')?.client).toBe(sessionManager.resolved('perSession')?.client);
+  });
+
+  it('routes reconnect to the manager that owns the server', async () => {
+    const workspaceManager = new FakeMcpManager();
+    const sessionManager = new FakeMcpManager();
+    const workspaceClient = fakeMcpClient();
+    const sessionClient = fakeMcpClient();
+    workspaceManager.setResolved('shared', workspaceClient, await discoverTools(workspaceClient));
+    sessionManager.setResolved('perSession', sessionClient, await discoverTools(sessionClient));
+    const svc = createService(workspaceManager, sessionManager);
+    workspaceManager.connect('shared');
+    sessionManager.connect('perSession');
+
+    const reconnects: string[] = [];
+    workspaceManager.reconnectHandler = async (name) => {
+      reconnects.push(`workspace:${name}`);
+    };
+    sessionManager.reconnectHandler = async (name) => {
+      reconnects.push(`session:${name}`);
+    };
+
+    await svc.reconnect('perSession');
+    await svc.reconnect('shared');
+    expect(reconnects).toEqual(['session:perSession', 'workspace:shared']);
+  });
+
+  it('waits for both managers on waitForInitialLoad', async () => {
+    const workspaceManager = new FakeMcpManager();
+    const sessionManager = new FakeMcpManager();
+    const gate = deferred<void>();
+    sessionManager.waitForInitialLoad = () => gate.promise;
+    const svc = createService(workspaceManager, sessionManager);
+
+    let settled = false;
+    const wait = svc.waitForInitialLoad().then(() => {
+      settled = true;
+    });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    expect(settled).toBe(false);
+    gate.resolve();
+    await wait;
+    expect(settled).toBe(true);
   });
 
   it('resolves through the IAgentMcpService binding with no manager', () => {
