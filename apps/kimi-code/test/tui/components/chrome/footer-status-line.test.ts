@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { FooterComponent } from '#/tui/components/chrome/footer';
 import {
@@ -96,6 +96,11 @@ describe('FooterComponent status_line items', () => {
   });
 
   it('honors the configured position of the tips slot', () => {
+    // The tip rotates on a 10s wall-clock index, so a boundary crossing
+    // between the three renders below would compare two different tips.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+
     // The tip content itself rotates; locate it via a tips-only render.
     const tipsOnly = plain(
       new FooterComponent({
@@ -122,6 +127,10 @@ describe('FooterComponent status_line items', () => {
     expect(tipsLast.indexOf('kimi-k2')).toBeLessThan(tipsLast.indexOf(tipsOnly));
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('renders nothing on line 1 for an empty items list', () => {
     const state: AppState = {
       ...baseState,
@@ -133,16 +142,26 @@ describe('FooterComponent status_line items', () => {
   });
 });
 
+// Spawning `sh` from a loaded vitest worker regularly costs more than the
+// product's 300ms ceiling, so the behavioural cases pass an explicit, generous
+// timeout; the ceiling itself is covered by the `sleep 2` case below. The
+// cases that cannot inject one (they go through the footer / the runner) poll
+// instead, which re-kicks the throttled runner until a spawn lands — both need
+// a per-test budget above vitest's 5s default.
+const SPAWN_TIMEOUT_MS = 20_000;
+const SLOW_SPAWN_TEST_MS = 30_000;
+const POLL = { timeout: 20_000, interval: 100 } as const;
+
 describe('runStatusLineCommand', () => {
   it('passes the payload as JSON on stdin and returns the first stdout line', async () => {
-    const line = await runStatusLineCommand('cat', payload);
+    const line = await runStatusLineCommand('cat', payload, SPAWN_TIMEOUT_MS);
 
     expect(line).not.toBeNull();
     const parsed = JSON.parse(line!);
     expect(parsed.model).toBe('kimi-k2');
     expect(parsed.gitBranch).toBe('main');
     expect(parsed.cwd).toBe('/tmp/project');
-  });
+  }, SLOW_SPAWN_TEST_MS);
 
   it('returns null on a nonzero exit', async () => {
     expect(await runStatusLineCommand('exit 3', payload)).toBeNull();
@@ -157,21 +176,22 @@ describe('runStatusLineCommand', () => {
   });
 
   it('trims the line and ignores later lines', async () => {
-    const line = await runStatusLineCommand('printf "first\\nsecond\\n"', payload);
+    const line = await runStatusLineCommand('printf "first\\nsecond\\n"', payload, SPAWN_TIMEOUT_MS);
 
     expect(line).toBe('first');
-  });
+  }, SLOW_SPAWN_TEST_MS);
 
   it('caps the captured output instead of accumulating an unending stream', async () => {
     // 200 KB on a single line, then exit: only the capped prefix is kept.
     const line = await runStatusLineCommand(
       'head -c 200000 /dev/zero | tr "\\0" "a"',
       payload,
+      SPAWN_TIMEOUT_MS,
     );
 
     expect(line).not.toBeNull();
     expect(line!.length).toBeLessThanOrEqual(STATUS_LINE_MAX_CAPTURE_BYTES);
-  });
+  }, SLOW_SPAWN_TEST_MS);
 });
 
 describe('FooterComponent status_line command', () => {
@@ -185,10 +205,15 @@ describe('FooterComponent status_line command', () => {
     // Before the first run completes the built-in layout is still shown.
     expect(plain(footer.render(120)[0]!)).toContain('kimi-k2');
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
-
-    expect(plain(footer.render(120)[0]!)).toContain('my-custom-status');
-  });
+    // Each render re-kicks the throttled runner, so a spawn that overran the
+    // command timeout is retried instead of failing the test.
+    await vi.waitFor(
+      () => {
+        expect(plain(footer.render(120)[0]!)).toContain('my-custom-status');
+      },
+      POLL,
+    );
+  }, SLOW_SPAWN_TEST_MS);
 
   it('keeps the built-in layout when the command fails', async () => {
     const state: AppState = {
@@ -205,14 +230,15 @@ describe('FooterComponent status_line command', () => {
 
 describe('StatusLineCommandRunner', () => {
   it('caches the last good line and coalesces refreshes in the same interval', async () => {
-    const runner = new StatusLineCommandRunner('printf "x"', () => {});
+    const runner = new StatusLineCommandRunner('printf "x"', () => {}, SPAWN_TIMEOUT_MS);
 
     runner.maybeRefresh(payload);
     runner.maybeRefresh(payload);
-    await new Promise((resolve) => setTimeout(resolve, 200));
-
-    expect(runner.current()).toBe('x');
-  });
+    await vi.waitFor(() => {
+      expect(runner.current()).toBe('x');
+    }, POLL);
+    runner.dispose();
+  }, SLOW_SPAWN_TEST_MS);
 
   it('runs a deferred refresh after the throttle interval instead of dropping it', async () => {
     const dir = join(tmpdir(), `sl-trailing-${process.pid}-${Math.random().toString(36).slice(2)}`);
@@ -225,21 +251,33 @@ describe('StatusLineCommandRunner', () => {
         scriptFile,
         '#!/bin/sh\nn=$(cat "$1")\necho $((n+1)) > "$1"\nprintf "run-%s" "$n"\n',
       );
-      const runner = new StatusLineCommandRunner(`sh ${scriptFile} ${counterFile}`, () => {});
+      const runner = new StatusLineCommandRunner(
+        `sh ${scriptFile} ${counterFile}`,
+        () => {},
+        SPAWN_TIMEOUT_MS,
+      );
 
       runner.maybeRefresh(payload);
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await vi.waitFor(
+        () => {
+          expect(readFileSync(counterFile, 'utf-8').trim()).toBe('1');
+        },
+        { timeout: 20_000, interval: 50 },
+      );
       runner.maybeRefresh(payload); // throttled: must defer, not drop
-      await new Promise((resolve) => setTimeout(resolve, 250));
       expect(readFileSync(counterFile, 'utf-8').trim()).toBe('1');
 
-      await new Promise((resolve) => setTimeout(resolve, 800));
-      expect(readFileSync(counterFile, 'utf-8').trim()).toBe('2');
+      await vi.waitFor(
+        () => {
+          expect(readFileSync(counterFile, 'utf-8').trim()).toBe('2');
+        },
+        { timeout: 20_000, interval: 50 },
+      );
       runner.dispose();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, SLOW_SPAWN_TEST_MS);
 
   it('recreates the runner when the command changes', async () => {
     const state: AppState = {
@@ -248,15 +286,24 @@ describe('StatusLineCommandRunner', () => {
     };
     const footer = new FooterComponent(state);
     footer.render(120); // kicks the first run
-    await new Promise((resolve) => setTimeout(resolve, 450));
-    expect(plain(footer.render(120)[0]!)).toContain('aaa');
+    await vi.waitFor(
+      () => {
+        expect(plain(footer.render(120)[0]!)).toContain('aaa');
+      },
+      POLL,
+    );
 
     footer.setState({ ...state, statusLine: { items: null, command: 'printf "bbb"' } });
     footer.render(120); // kicks the replacement run
-    await new Promise((resolve) => setTimeout(resolve, 450));
+    await vi.waitFor(
+      () => {
+        expect(plain(footer.render(120)[0]!)).toContain('bbb');
+      },
+      POLL,
+    );
 
     const line1 = plain(footer.render(120)[0]!);
     expect(line1).toContain('bbb');
     expect(line1).not.toContain('aaa');
-  });
+  }, SLOW_SPAWN_TEST_MS);
 });

@@ -130,6 +130,8 @@ export class StatusLineCommandRunner {
   constructor(
     readonly command: string,
     private readonly onUpdate: () => void,
+    /** Per-run ceiling; overridable so tests need not race the 300ms default. */
+    private readonly timeoutMs: number = STATUS_LINE_COMMAND_TIMEOUT_MS,
   ) {}
 
   current(): string | null {
@@ -171,7 +173,7 @@ export class StatusLineCommandRunner {
   private startRun(payload: StatusLinePayload, now: number): void {
     this.inFlight = true;
     this.lastRunAt = now;
-    void runStatusLineCommand(this.command, payload).then((line) => {
+    void runStatusLineCommand(this.command, payload, this.timeoutMs).then((line) => {
       this.inFlight = false;
       if (line !== null) {
         this.cached = line;

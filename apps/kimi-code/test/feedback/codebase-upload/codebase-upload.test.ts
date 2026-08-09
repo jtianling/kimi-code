@@ -293,7 +293,9 @@ describe('scanCodebase filtering', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+    // Two `git` spawns plus a scan: the 5s default is too tight for a loaded
+    // worker.
+  }, 30_000);
 
   it('filters sensitive files by glob outside a git work tree', async () => {
     const root = await mkdtemp(join(tmpdir(), 'feedback-scan-sensitive-'));
