@@ -66,10 +66,13 @@ export type {
   SessionFacade,
   SessionInteractionsFacade,
   SessionQuestionsFacade,
+  SessionRestoreOptions,
+  SessionSkillsFacade,
   SessionStatus,
   SessionWarning,
 } from './core/facade/session.js';
 export type {
+  AgentCommandInfo,
   AgentContextData,
   AgentFacade,
   AgentTaskInfo,
@@ -77,12 +80,13 @@ export type {
   CreateGoalInput,
   GoalSnapshot,
   GoalToolResult,
+  McpServerEntry,
   PlanData,
   PromptLaunchResult,
   SetModelResult,
   ShellCommandResult,
-  SkillSummary,
   SwarmModeTrigger,
+  ThinkingLevel,
   UsageStatus,
 } from './core/facade/agent.js';
 
@@ -142,6 +146,7 @@ export type {
   Interaction,
   InteractionKind,
 } from '@moonshot-ai/agent-core-v2/session/interaction/interaction';
+export type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 export type { ContentPart } from '@moonshot-ai/agent-core-v2/kosong/contract/message';
 export type { ThinkingEffort } from '@moonshot-ai/agent-core-v2/kosong/contract/provider';
 export type { PermissionMode } from '@moonshot-ai/agent-core-v2/agent/permissionPolicy/types';

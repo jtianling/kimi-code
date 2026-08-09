@@ -18,6 +18,7 @@ defineKlientConformance('memory', async () => {
   const klient = createKlient({ scope: app });
   return {
     klient,
+    app,
     cleanup: async () => {
       await klient.close();
       app.dispose();
@@ -191,7 +192,7 @@ describe('agent facade (real engine)', () => {
         (skill.type === undefined || skill.type === 'prompt' || skill.type === 'flow'),
     );
     expect(activatable).toBeDefined();
-    await expect(agent.activateSkill(activatable!.name)).resolves.toBeUndefined();
+    await expect(agent.activateSkill({ name: activatable!.name })).resolves.toBeDefined();
   });
 });
 

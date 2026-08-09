@@ -147,12 +147,13 @@ describe('remote harness (createKimiHarnessV2Remote)', () => {
     );
 
     server = await startServer({ homeDir, port: 0, hostIdentity: TEST_IDENTITY });
-    expect(server.klientIpcSocketPath).toBeDefined();
+    const socketPath = server.klientIpcSocketPath;
+    if (socketPath === undefined) throw new Error('server did not expose a klient ipc socket');
 
     harness = createKimiHarnessV2Remote(
       { homeDir, identity: TEST_IDENTITY },
       {
-        socketPath: server.klientIpcSocketPath!,
+        socketPath,
         token: server.authTokenService.getToken(),
       },
     );

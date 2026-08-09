@@ -18,7 +18,8 @@
  */
 
 import { Disposable } from '#/_base/di/lifecycle';
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
 import { ILogService } from '#/_base/log/log';
 
 import { IMcpOAuthStore } from '#/app/mcpConfig/oauthStore';

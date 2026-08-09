@@ -180,6 +180,14 @@ class FakeMcpManager {
     this.entries.delete(name);
   }
 
+  markRemoved(name: string): void {
+    const current = this.entries.get(name);
+    if (current === undefined) return;
+    const entry: McpServerEntry = { ...current, status: 'removed', toolCount: 0 };
+    this.entries.set(name, entry);
+    this.emit(entry);
+  }
+
   private emit(entry: McpServerEntry): void {
     for (const listener of this.listeners) {
       listener(entry);
@@ -224,21 +232,27 @@ describe('AgentMcpService', () => {
     disposables.dispose();
   });
 
-  function createService(manager: FakeMcpManager, sessionManager?: FakeMcpManager): AgentMcpService {
+  function createService(
+    manager: FakeMcpManager,
+    sessionManager?: FakeMcpManager,
+    ready: Promise<void> = Promise.resolve(),
+    isBaselineServer: (name: string) => boolean = () => true,
+    sessionReady: Promise<void> = Promise.resolve(),
+  ): IAgentMcpService {
     ix.stub(ISessionMcpHandle, {
       _serviceBrand: undefined,
-      ready: Promise.resolve(),
+      ready,
       connectionManager: manager as unknown as McpConnectionManager,
+      isBaselineServer,
     } satisfies ISessionMcpHandle);
     ix.stub(ISessionMcpService, {
       _serviceBrand: undefined,
-      ready: Promise.resolve(),
+      ready: sessionReady,
       connectionManager: (sessionManager ?? new FakeMcpManager()) as unknown as McpConnectionManager,
     } satisfies ISessionMcpService);
     ix.stub(ISessionContext, { sessionDir: '/tmp/kimi-code-mcp-test' });
-    const svc = ix.createInstance(AgentMcpService);
-    disposables.add(svc);
-    return svc;
+    ix.set(IAgentMcpService, new SyncDescriptor(AgentMcpService));
+    return ix.get(IAgentMcpService);
   }
 
   it('delegates list / status events to the connection manager', async () => {
@@ -310,12 +324,17 @@ describe('AgentMcpService', () => {
     expect(reconnects).toEqual(['session:perSession', 'workspace:shared']);
   });
 
-  it('waits for both managers on waitForInitialLoad', async () => {
+  it('waits for both the workspace handle and the session manager on waitForInitialLoad', async () => {
     const workspaceManager = new FakeMcpManager();
     const sessionManager = new FakeMcpManager();
     const gate = deferred<void>();
-    sessionManager.waitForInitialLoad = () => gate.promise;
-    const svc = createService(workspaceManager, sessionManager);
+    const svc = createService(
+      workspaceManager,
+      sessionManager,
+      Promise.resolve(),
+      () => true,
+      gate.promise,
+    );
 
     let settled = false;
     const wait = svc.waitForInitialLoad().then(() => {
@@ -325,12 +344,34 @@ describe('AgentMcpService', () => {
     expect(settled).toBe(false);
     gate.resolve();
     await wait;
+  });
+
+  it('holds the LLM step until the session MCP handle is ready', async () => {
+    const manager = new FakeMcpManager();
+    let releaseReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      releaseReady = resolve;
+    });
+    createService(manager, undefined, ready);
+
+    const loop = ix.get(IAgentLoopService);
+    let settled = false;
+    const step = loop.hooks.onWillBeginStep
+      .run({ turnId: 1, step: 1, signal: new AbortController().signal })
+      .then(() => {
+        settled = true;
+      });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    releaseReady();
+    await step;
     expect(settled).toBe(true);
   });
 
   it('resolves through the IAgentMcpService binding with no manager', () => {
     const created = createService(new FakeMcpManager());
-    ix.set(IAgentMcpService, created);
     const svc = ix.get(IAgentMcpService);
     expect(svc).toBe(created);
     expect(svc.list()).toEqual([]);
@@ -354,6 +395,51 @@ describe('AgentMcpService', () => {
         type: 'tool.list.updated',
         reason: 'mcp.connected',
         serverName: 'local server',
+      }),
+    );
+  });
+
+  it('ignores status changes from servers outside the session baseline', async () => {
+    const manager = new FakeMcpManager();
+    const lateClient = fakeMcpClient();
+    manager.setResolved('late server', lateClient, await discoverTools(lateClient));
+    const baseClient = fakeMcpClient();
+    manager.setResolved('base server', baseClient, await discoverTools(baseClient));
+    createService(manager, undefined, Promise.resolve(), (name) => name === 'base server');
+
+    const mcpToolNames = () =>
+      ix
+        .get(IAgentToolRegistryService)
+        .list()
+        .filter((tool) => tool.source === 'mcp')
+        .map((tool) => tool.name);
+
+    manager.connect('late server');
+
+    expect(mcpToolNames()).toEqual([]);
+    expect(
+      events.filter(
+        (event) => event.type === 'mcp.server.status' || event.type === 'tool.list.updated',
+      ),
+    ).toEqual([]);
+
+    manager.connect('base server');
+
+    expect(mcpToolNames().toSorted()).toEqual([
+      'mcp__base_server__echo',
+      'mcp__base_server__noop',
+    ]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'mcp.server.status',
+        server: expect.objectContaining({ name: 'base server', status: 'connected' }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'tool.list.updated',
+        reason: 'mcp.connected',
+        serverName: 'base server',
       }),
     );
   });
@@ -389,6 +475,48 @@ describe('AgentMcpService', () => {
         serverName: 's',
       }),
     );
+  });
+
+  it('keeps tools registered when the server is tombstoned as removed, and calls fail with a removal notice', async () => {
+    const manager = new FakeMcpManager();
+    const counter = { calls: 0 };
+    const client = countingClient(fakeMcpClient(), counter);
+    manager.setResolved('s', client, await discoverTools(client));
+    createService(manager);
+    manager.connect('s');
+    expect(ix.get(IAgentToolRegistryService).list().filter((tool) => tool.source === 'mcp')).toHaveLength(2);
+
+    manager.markRemoved('s');
+
+    const registered = ix.get(IAgentToolRegistryService).list().filter((tool) => tool.source === 'mcp');
+    expect(registered).toHaveLength(2);
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: 'tool.list.updated', reason: 'mcp.disconnected' }),
+    );
+
+    const echo = ix.get(IAgentToolRegistryService).resolve('mcp__s__echo');
+    expect(echo).toBeDefined();
+    const result = await executeTool(echo!, {
+      turnId: 1,
+      toolCallId: 'tc-removed',
+      args: { text: 'hello world' },
+      signal: new AbortController().signal,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.output).toContain('has been removed');
+    expect(counter.calls).toBe(0);
+  });
+
+  it('does not register tools for a server tombstoned before the agent attached', async () => {
+    const manager = new FakeMcpManager();
+    const client = fakeMcpClient();
+    manager.setResolved('s', client, await discoverTools(client));
+    manager.connect('s');
+    manager.markRemoved('s');
+
+    createService(manager);
+
+    expect(ix.get(IAgentToolRegistryService).list().filter((tool) => tool.source === 'mcp')).toEqual([]);
   });
 
   it('reports same-server qualified-name collisions and keeps only the first tool', async () => {
@@ -556,10 +684,6 @@ describe('AgentMcpService', () => {
     createService(manager);
     manager.connect('s');
 
-    // The connection drops while no call is in flight: the manager marks the
-    // server failed. The tools must stay registered so the next call reaches
-    // the adapter and its reconnect-and-retry path instead of failing with
-    // "tool not found".
     manager.fail('s');
 
     const echo = ix.get(IAgentToolRegistryService).resolve('mcp__s__echo');
@@ -626,8 +750,6 @@ describe('AgentMcpService', () => {
         signal: new AbortController().signal,
       }),
     ).rejects.toThrow('Connection closed');
-    // The tools stay registered after the failed reconnect so a later call
-    // can try healing the server again instead of hitting "tool not found".
     expect(ix.get(IAgentToolRegistryService).list().filter((tool) => tool.source === 'mcp')).toHaveLength(2);
   });
 
@@ -809,9 +931,6 @@ describe('AgentMcpService', () => {
     const registry = ix.get(IAgentToolRegistryService);
     const staleEcho = registry.resolve('mcp__s__echo');
 
-    // Resolve the stale tool first, then heal the server the way a parallel
-    // call's reconnect would: the resolved entry swaps to a fresh client and
-    // the registry re-seeds, leaving `staleEcho` bound to the dead client.
     manager.setResolved('s', freshClient, await discoverTools(freshClient));
     manager.connect('s');
 

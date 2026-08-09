@@ -8,21 +8,22 @@
  */
 
 import type { IAgentRPCService } from '@moonshot-ai/agent-core-v2/agent/rpc/rpc';
+import type { IAgentCommandService } from '@moonshot-ai/agent-core-v2/agent/command/agentCommand';
 import type { ContextMessage } from '@moonshot-ai/agent-core-v2/agent/contextMemory/types';
-import type { IAgentContextSizeService } from '@moonshot-ai/agent-core-v2/agent/contextSize/contextSize';
+import type { IAgentTokenCountingService } from '@moonshot-ai/agent-core-v2/agent/tokenCounting/tokenCounting';
 import type { IAgentGoalService } from '@moonshot-ai/agent-core-v2/agent/goal/goal';
 import type { IAgentLoopService } from '@moonshot-ai/agent-core-v2/agent/loop/loop';
+import type { IAgentMcpService } from '@moonshot-ai/agent-core-v2/agent/mcp/mcp';
 import type { IAgentPermissionRulesService } from '@moonshot-ai/agent-core-v2/agent/permissionRules/permissionRules';
-import type { IAgentPlanService } from '@moonshot-ai/agent-core-v2/agent/plan/plan';
+import type { IAgentPlanService } from '@moonshot-ai/agent-core-v2/features/plan/plan';
 import type { IAgentProfileService } from '@moonshot-ai/agent-core-v2/agent/profile/profile';
 import type { IAgentShellCommandService } from '@moonshot-ai/agent-core-v2/agent/shellCommand/shellCommand';
-import type { IAgentSwarmService, SwarmModeTrigger } from '@moonshot-ai/agent-core-v2/agent/swarm/swarm';
+import type { SwarmModeTrigger } from '@moonshot-ai/agent-core-v2/agent/swarm/swarm';
 import type { IAgentTaskService } from '@moonshot-ai/agent-core-v2/agent/task/task';
 import type { IAgentUsageService } from '@moonshot-ai/agent-core-v2/agent/usage/usage';
 import type { AgentActivityState } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
 import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 import type { ContentPart } from '@moonshot-ai/agent-core-v2/kosong/contract/message';
-import type { ThinkingEffort } from '@moonshot-ai/agent-core-v2/kosong/contract/provider';
 import type { PermissionMode } from '@moonshot-ai/agent-core-v2/agent/permissionPolicy/types';
 
 import type { ScopeRef } from '../channel.js';
@@ -33,11 +34,13 @@ import type { ScopedCaller } from './session.js';
 export type PromptLaunchResult = Awaited<ReturnType<IAgentRPCService['prompt']>>;
 export type ShellCommandResult = Awaited<ReturnType<IAgentShellCommandService['run']>>;
 export type SetModelResult = Awaited<ReturnType<IAgentProfileService['setModel']>>;
+export type ThinkingLevel = ReturnType<IAgentProfileService['getEffectiveThinkingLevel']>;
 export type UsageStatus = Awaited<ReturnType<IAgentUsageService['status']>>;
 export type AgentContextData = Awaited<ReturnType<IAgentRPCService['getContext']>>;
+export type AgentCommandInfo = Awaited<ReturnType<IAgentCommandService['list']>>[number];
 export type PlanData = Awaited<ReturnType<IAgentPlanService['status']>>;
 export type ModelCapability = ReturnType<IAgentProfileService['getModelCapabilities']>;
-export type ContextSize = ReturnType<IAgentContextSizeService['get']>;
+export type ContextSize = ReturnType<IAgentTokenCountingService['get']>;
 export type AgentTaskInfo = Awaited<ReturnType<IAgentTaskService['list']>>[number];
 export type CreateGoalInput = Parameters<IAgentGoalService['createGoal']>[0];
 export type GoalSnapshot = Awaited<ReturnType<IAgentGoalService['createGoal']>>;
@@ -56,6 +59,7 @@ export type AgentToolInfo = Awaited<ReturnType<IAgentRPCService['getTools']>>[nu
   readonly active: boolean;
 };
 export type { SkillSummary, SwarmModeTrigger };
+export type McpServerEntry = ReturnType<IAgentMcpService['list']>[number];
 
 export interface AgentFacade {
   prompt(input: {
@@ -63,14 +67,25 @@ export interface AgentFacade {
     disabledTools?: readonly string[];
   }): Promise<PromptLaunchResult>;
   steer(input: { input: readonly ContentPart[] }): Promise<PromptLaunchResult>;
+  /**
+   * Activate a skill as a user-slash activation: the engine renders the skill
+   * prompt and drives it as a normal turn (same settlement/event flow as
+   * `prompt`). Resolves with the launched turn id; rejects when the skill is
+   * unknown or the agent is busy.
+   */
+  activateSkill(input: { name: string; args?: string }): Promise<PromptLaunchResult>;
   cancel(input?: { turnId?: number }): Promise<void>;
   runShellCommand(input: { command: string; commandId?: string }): Promise<ShellCommandResult>;
   cancelShellCommand(input: { commandId: string }): Promise<void>;
   getModel(): Promise<string>;
   setModel(model: string): Promise<SetModelResult>;
+  getThinking(): Promise<ThinkingLevel>;
+  setThinking(level: string): Promise<void>;
   setPermission(mode: PermissionMode): Promise<void>;
   getUsage(): Promise<UsageStatus>;
   getContext(): Promise<AgentContextData>;
+  listCommands(): Promise<readonly AgentCommandInfo[]>;
+  runCommand(input: { name: string; args?: string }): Promise<void>;
   getPlan(): Promise<PlanData>;
   enterPlan(): Promise<void>;
   clearPlan(): Promise<void>;
@@ -86,19 +101,27 @@ export interface AgentFacade {
   cancelGoal(): Promise<GoalSnapshot>;
   // --- Skills --------------------------------------------------------------
   listSkills(): Promise<readonly SkillSummary[]>;
-  activateSkill(name: string, args?: string): Promise<void>;
   // --- Swarm ---------------------------------------------------------------
   setSwarmMode(enabled: boolean, trigger: SwarmModeTrigger): Promise<void>;
   // --- Compaction ----------------------------------------------------------
-  compact(input?: { instruction?: string }): Promise<void>;
+  /**
+   * Trigger a manual full compaction. Async: `true` means the compaction was
+   * started (it runs in the background); `false` means one is already running.
+   * Throws when there is nothing to compact or a turn is active.
+   */
+  compact(input?: { instruction?: string }): Promise<boolean>;
   cancelCompaction(): Promise<void>;
-  // --- Tools / thinking ------------------------------------------------------
-  setThinking(effort: ThinkingEffort): Promise<void>;
+  // --- Tools -----------------------------------------------------------------
   getTools(): Promise<readonly AgentToolInfo[]>;
   setActiveTools(tools: readonly string[]): Promise<void>;
   // --- Model capabilities / context size (status snapshot enrichment) ---------
   getModelCapabilities(): Promise<ModelCapability>;
   getContextSize(): Promise<ContextSize>;
+  /**
+   * The externally reported context size, resolved by the engine's
+   * `[token_counting]` strategy — what a status snapshot should show.
+   */
+  getStatusContextSize(): Promise<number>;
   // --- History / tasks -------------------------------------------------------
   undoHistory(count?: number): Promise<number>;
   detachBackgroundTask(taskId: string): Promise<AgentTaskInfo | undefined>;
@@ -136,6 +159,12 @@ export interface AgentFacade {
    */
   activateSkillAwaited(name: string, args?: string): Promise<void>;
   activatePluginCommand(input: ActivatePluginCommandInput): Promise<void>;
+  /**
+   * Session-merged MCP server entries (workspace set + ephemeral session
+   * overlay). This is a live snapshot, so entries may still be pending while
+   * the initial connection attempt runs.
+   */
+  getMcpServers(): Promise<readonly McpServerEntry[]>;
 }
 
 export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFacade {
@@ -145,6 +174,7 @@ export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFac
   return {
     prompt: (input) => rpc('prompt', input) as Promise<PromptLaunchResult>,
     steer: (input) => rpc('steer', input) as Promise<PromptLaunchResult>,
+    activateSkill: (input) => rpc('activateSkill', input) as Promise<PromptLaunchResult>,
     cancel: (input) => rpc('cancel', input ?? {}) as Promise<void>,
     runShellCommand: (input) =>
       call(scope, 'agentShellCommandService', 'run', [input]) as Promise<ShellCommandResult>,
@@ -153,9 +183,15 @@ export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFac
     getModel: () => call(scope, 'agentProfileService', 'getModel', []) as Promise<string>,
     setModel: (model) =>
       call(scope, 'agentProfileService', 'setModel', [model]) as Promise<SetModelResult>,
+    getThinking: () =>
+      call(scope, 'agentProfileService', 'getEffectiveThinkingLevel', []) as Promise<ThinkingLevel>,
+    setThinking: (level) =>
+      call(scope, 'agentProfileService', 'setThinking', [level]) as Promise<void>,
     setPermission: (mode) => rpc('setPermission', { mode }) as Promise<void>,
     getUsage: () => call(scope, 'agentUsageService', 'status', []) as Promise<UsageStatus>,
     getContext: () => rpc('getContext', {}) as Promise<AgentContextData>,
+    listCommands: () => rpc('listCommands', {}) as Promise<readonly AgentCommandInfo[]>,
+    runCommand: (input) => rpc('runCommand', input) as Promise<void>,
     getPlan: () => call(scope, 'agentPlanService', 'status', []) as Promise<PlanData>,
     enterPlan: () => call(scope, 'agentPlanService', 'enter', []) as Promise<void>,
     clearPlan: () => call(scope, 'agentPlanService', 'clear', []) as Promise<void>,
@@ -187,10 +223,7 @@ export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFac
     // `listSkills` is dispatcher-synthesized from the session-scope catalog
     // (see dispatcher.ts); the agent scope resolves the parent-scope service.
     listSkills: () =>
-      call(scope, 'sessionSkillCatalog', 'listSkills', []) as Promise<readonly SkillSummary[]>,
-    // Fire-and-forget like the v1 RPC: the skill turn launches in the
-    // background and also updates the session prompt metadata.
-    activateSkill: (name, args) => rpc('activateSkill', { name, args }) as Promise<void>,
+      call(scope, 'sessionSkillCatalog', 'list', []) as Promise<readonly SkillSummary[]>,
     setSwarmMode: async (enabled, trigger) => {
       if (enabled) {
         await call(scope, 'agentSwarmService', 'enter', [trigger]);
@@ -198,16 +231,11 @@ export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFac
       }
       await call(scope, 'agentSwarmService', 'exit', []);
     },
-    // `begin` reports whether the compaction started (`false` = one is
-    // already running); the v1 SDK surface is `void`, so the flag is dropped.
-    compact: async (input) => {
-      await call(scope, 'agentFullCompactionService', 'begin', [
+    compact: (input) =>
+      call(scope, 'agentFullCompactionService', 'begin', [
         { source: 'manual', instruction: input?.instruction },
-      ]);
-    },
+      ]) as Promise<boolean>,
     cancelCompaction: () => rpc('cancelCompaction', {}) as Promise<void>,
-    setThinking: (effort) =>
-      call(scope, 'agentProfileService', 'setThinking', [effort]) as Promise<void>,
     getTools: () => rpc('getTools', {}) as Promise<readonly AgentToolInfo[]>,
     setActiveTools: (tools) =>
       call(scope, 'agentProfileService', 'update', [
@@ -248,6 +276,10 @@ export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFac
     getModelCapabilities: () =>
       call(scope, 'agentProfileService', 'getModelCapabilities', []) as Promise<ModelCapability>,
     getContextSize: () =>
-      call(scope, 'agentContextSizeService', 'get', []) as Promise<ContextSize>,
+      call(scope, 'agentTokenCountingService', 'get', []) as Promise<ContextSize>,
+    getStatusContextSize: () =>
+      call(scope, 'agentTokenCountingService', 'statusSize', []) as Promise<number>,
+    getMcpServers: () =>
+      call(scope, 'agentMcpService', 'list', []) as Promise<readonly McpServerEntry[]>,
   };
 }

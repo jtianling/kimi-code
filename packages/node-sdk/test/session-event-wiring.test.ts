@@ -67,9 +67,9 @@ function makeAgent(id: string, options: FakeAgentOptions = {}): AgentHandle {
     id,
     events,
     getUsage: incomplete ? () => Promise.reject(new Error('dead')) : () => Promise.resolve(USAGE),
-    getContextSize: incomplete
+    getStatusContextSize: incomplete
       ? () => Promise.reject(new Error('dead'))
-      : () => Promise.resolve({ size: 10, measured: 8, estimated: 2 }),
+      : () => Promise.resolve(10),
     getModelCapabilities: incomplete
       ? () => Promise.reject(new Error('dead'))
       : () => Promise.resolve({ max_context_tokens: 128_000 }),

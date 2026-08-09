@@ -150,7 +150,7 @@ export class SessionEventWiring {
     for (const agentId of Object.keys(agents)) {
       this.attachAgent(agentId);
     }
-    for (const agentId of [...this.agentSubscriptions.keys()]) {
+    for (const agentId of Array.from(this.agentSubscriptions.keys())) {
       if (!(agentId in agents)) this.detachAgent(agentId);
     }
   }
@@ -204,28 +204,25 @@ export class SessionEventWiring {
   /**
    * Facade edition of the in-process status enrichment: fold a usage +
    * context + model snapshot into every status event, restoring the v1
-   * combined-payload contract. Two deliberate degradations versus the
-   * in-process version (both recorded in the direction-B roadmap):
-   * - `contextTokens` is `contextSize.size` alone; the
-   *   `IWireService.getModel(ContextSizeModel)` measured-token floor is not
-   *   wire-exposable (a `ModelDef` cannot cross processes).
+   * combined-payload contract. One deliberate degradation versus the
+   * in-process version (recorded in the direction-B roadmap):
    * - the secondary-model derived alias is passed through unresolved; the
    *   catalog lookup that maps it to a display name is in-process only.
    * Missing reads (dead agent scope, mid-teardown) drop the enrichment for
    * that event instead of failing the stream.
    */
   private async withStatusSnapshot(agent: AgentHandle, event: DomainEvent): Promise<DomainEvent> {
-    const [usage, contextSize, capabilities, model] = await Promise.all([
+    const [usage, contextTokens, capabilities, model] = await Promise.all([
       agent.getUsage().catch(() => undefined),
-      agent.getContextSize().catch(() => undefined),
+      agent.getStatusContextSize().catch(() => undefined),
       agent.getModelCapabilities().catch(() => undefined),
       agent.getModel().catch(() => undefined),
     ]);
-    if (usage === undefined || contextSize === undefined) return event;
+    if (usage === undefined || contextTokens === undefined) return event;
     return {
       ...event,
       usage,
-      contextTokens: contextSize.size,
+      contextTokens,
       maxContextTokens: capabilities?.max_input_tokens ?? capabilities?.max_context_tokens,
       model,
     } as unknown as DomainEvent;

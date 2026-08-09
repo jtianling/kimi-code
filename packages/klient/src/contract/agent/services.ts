@@ -52,7 +52,7 @@ export const modelCapabilitySchema = z.object({
   dynamically_loaded_tools: z.boolean().optional(),
 });
 
-/** `ContextSize` (`agent-core-v2/agent/contextSize/contextSize.ts`). */
+/** `ContextSize` (`agent-core-v2/agent/tokenCounting/tokenCounting.ts`). */
 export const contextSizeSchema = z.object({
   size: z.number(),
   measured: z.number(),
@@ -86,6 +86,7 @@ export const agentProfileContract = {
   getModel: { input: z.tuple([]), output: z.string() },
   setModel: { input: z.tuple([z.string()]), output: setModelResultSchema },
   setThinking: { input: z.tuple([z.string()]), output: noResult },
+  getEffectiveThinkingLevel: { input: z.tuple([]), output: z.string() },
   update: { input: z.tuple([profileUpdateDataSchema]), output: noResult },
   bind: { input: z.tuple([bindAgentInputSchema]), output: noResult },
   data: { input: z.tuple([]), output: profileDataSchema },
@@ -100,6 +101,9 @@ export const agentContextSizeContract = {
     input: z.tuple([z.number().optional(), z.number().optional()]),
     output: contextSizeSchema,
   },
+  // The externally reported reading — the only one the `[token_counting]`
+  // strategy selects. Status snapshots use it; internal logic uses `get`.
+  statusSize: { input: z.tuple([]), output: z.number() },
 } satisfies ServiceContract;
 
 export const agentUsageContract = {

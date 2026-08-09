@@ -19,6 +19,7 @@ import {
 } from '@moonshot-ai/agent-core-v2/app/auth/auth';
 import { IFlagService } from '@moonshot-ai/agent-core-v2/app/flag/flag';
 import { IPluginService } from '@moonshot-ai/agent-core-v2/app/plugin/plugin';
+import { ICapabilityService } from '@moonshot-ai/agent-core-v2/app/capability/capability';
 import { IBootstrapService } from '@moonshot-ai/agent-core-v2/app/bootstrap/bootstrap';
 import { IEventService } from '@moonshot-ai/agent-core-v2/app/event/event';
 import { IHostFolderBrowser } from '@moonshot-ai/agent-core-v2/app/hostFolderBrowser/hostFolderBrowser';
@@ -36,6 +37,7 @@ import { ISessionInteractionService } from '@moonshot-ai/agent-core-v2/session/i
 import { ISessionApprovalService } from '@moonshot-ai/agent-core-v2/session/approval/approval';
 import { ISessionCronService } from '@moonshot-ai/agent-core-v2/session/cron/sessionCronService';
 import { ISessionQuestionService } from '@moonshot-ai/agent-core-v2/session/question/question';
+import { ISessionSkillCatalog } from '@moonshot-ai/agent-core-v2/session/sessionSkillCatalog/skillCatalog';
 import { IAgentRPCService } from '@moonshot-ai/agent-core-v2/agent/rpc/rpc';
 import { IAgentActivityView } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
 import { IAgentContextMemoryService } from '@moonshot-ai/agent-core-v2/agent/contextMemory/contextMemory';
@@ -45,15 +47,14 @@ import { IAgentLifecycleService } from '@moonshot-ai/agent-core-v2/session/agent
 import { IAgentLoopService } from '@moonshot-ai/agent-core-v2/agent/loop/loop';
 import { IAgentPermissionModeService } from '@moonshot-ai/agent-core-v2/agent/permissionMode/permissionMode';
 import { IAgentPermissionRulesService } from '@moonshot-ai/agent-core-v2/agent/permissionRules/permissionRules';
-import { IAgentPlanService } from '@moonshot-ai/agent-core-v2/agent/plan/plan';
+import { IAgentPlanService } from '@moonshot-ai/agent-core-v2/features/plan/plan';
 import { IAgentProfileService } from '@moonshot-ai/agent-core-v2/agent/profile/profile';
 import { IAgentSkillService } from '@moonshot-ai/agent-core-v2/agent/skill/skill';
 import { IAgentShellCommandService } from '@moonshot-ai/agent-core-v2/agent/shellCommand/shellCommand';
-import { IAgentContextSizeService } from '@moonshot-ai/agent-core-v2/agent/contextSize/contextSize';
+import { IAgentTokenCountingService } from '@moonshot-ai/agent-core-v2/agent/tokenCounting/tokenCounting';
 import { IAgentSwarmService } from '@moonshot-ai/agent-core-v2/agent/swarm/swarm';
 import { IAgentTaskService } from '@moonshot-ai/agent-core-v2/agent/task/task';
 import { IAgentUsageService } from '@moonshot-ai/agent-core-v2/agent/usage/usage';
-import { ISessionSkillCatalog } from '@moonshot-ai/agent-core-v2/session/sessionSkillCatalog/skillCatalog';
 import { ISessionBtwService } from '@moonshot-ai/agent-core-v2/session/btw/btw';
 import { ISessionSecondaryModelWarningService } from '@moonshot-ai/agent-core-v2/session/subagent/secondaryModelWarning';
 import { IAgentMcpService } from '@moonshot-ai/agent-core-v2/agent/mcp/mcp';
@@ -72,6 +73,7 @@ export const serviceTokens: Readonly<Record<string, ServiceIdentifier<unknown>>>
   authSummaryService: IAuthSummaryService,
   flagService: IFlagService,
   pluginService: IPluginService,
+  capabilityService: ICapabilityService,
   hostFolderBrowser: IHostFolderBrowser,
   bootstrapService: IBootstrapService,
   eventService: IEventService,
@@ -93,7 +95,6 @@ export const serviceTokens: Readonly<Record<string, ServiceIdentifier<unknown>>>
   sessionBtwService: ISessionBtwService,
   sessionSecondaryModelWarningService: ISessionSecondaryModelWarningService,
   agentLifecycleService: IAgentLifecycleService,
-  agentMcpService: IAgentMcpService,
   workspaceDirs: IWorkspaceDirs,
   agentRPCService: IAgentRPCService,
   agentActivityView: IAgentActivityView,
@@ -104,13 +105,14 @@ export const serviceTokens: Readonly<Record<string, ServiceIdentifier<unknown>>>
   agentPermissionModeService: IAgentPermissionModeService,
   agentPermissionRulesService: IAgentPermissionRulesService,
   agentShellCommandService: IAgentShellCommandService,
-  agentContextSizeService: IAgentContextSizeService,
+  agentTokenCountingService: IAgentTokenCountingService,
   agentProfileService: IAgentProfileService,
   agentSkillService: IAgentSkillService,
   agentSwarmService: IAgentSwarmService,
   agentUsageService: IAgentUsageService,
   agentPlanService: IAgentPlanService,
   agentTaskService: IAgentTaskService,
+  agentMcpService: IAgentMcpService,
 };
 
 export { IEventService };

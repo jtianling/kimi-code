@@ -7,6 +7,12 @@
  * selects the connection lifetime: `'workspace'` (the default) shares one
  * connection across every session of the workspace; `'session'` opts the
  * server into per-session connections owned by the `sessionMcp` domain.
+ *
+ * Remote variants accept `auth: "oauth"`, mirroring v1: OAuth is still
+ * discovered from a remote server's 401 response; the flag records that the
+ * user explicitly chose OAuth, so static `headers` on the same entry are
+ * treated as plain request headers (capability/identity declarations) rather
+ * than as the server's credentials.
  */
 
 import { z } from 'zod';
@@ -41,6 +47,7 @@ export const McpServerHttpConfigSchema = z.object({
   transport: z.literal('http'),
   url: z.string().url(),
   headers: StringRecordSchema.optional(),
+  auth: z.literal('oauth').optional(),
   bearerTokenEnvVar: z.string().min(1).optional(),
   ...McpServerCommonFields,
 });
@@ -51,6 +58,7 @@ export const McpServerSseConfigSchema = z.object({
   transport: z.literal('sse'),
   url: z.string().url(),
   headers: StringRecordSchema.optional(),
+  auth: z.literal('oauth').optional(),
   bearerTokenEnvVar: z.string().min(1).optional(),
   ...McpServerCommonFields,
 });

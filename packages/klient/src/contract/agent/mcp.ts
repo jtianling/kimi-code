@@ -23,6 +23,7 @@ export const mcpServerStatusSchema = z.enum([
   'failed',
   'disabled',
   'needs-auth',
+  'removed',
 ]);
 
 /** `McpServerEntry` (`agent-core-v2/mcpCore/connection-manager.ts`). */

@@ -346,6 +346,17 @@ describe('KimiHarness config API', () => {
         source: 'default',
       },
       {
+        id: 'tui-server-sync',
+        title: 'TUI server-turn sync',
+        description:
+          'Subscribe the interactive TUI to a local kimi server (/api/v1/ws) so turns driven on the open session by external clients (REST prompt injection) surface in the TUI and reload its context when they finish.',
+        surface: 'tui',
+        env: 'KIMI_CODE_EXPERIMENTAL_TUI_SERVER_SYNC',
+        defaultEnabled: false,
+        enabled: false,
+        source: 'default',
+      },
+      {
         id: 'secondary-model',
         title: 'Secondary model for subagents',
         description:

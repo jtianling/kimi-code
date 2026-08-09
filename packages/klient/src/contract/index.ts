@@ -30,6 +30,7 @@ import {
   agentUsageContract,
 } from './agent/services.js';
 import { authContract, authSummaryContract } from './global/auth.js';
+import { capabilitiesContract } from './global/capabilities.js';
 import { catalogContract } from './global/catalog.js';
 import { providerDiscoveryContract } from './global/providerDiscovery.js';
 import { configContract } from './global/config.js';
@@ -57,7 +58,7 @@ import {
 import { sessionMetadataContract } from './session/metadata.js';
 import { sessionQuestionContract } from './session/question.js';
 import { sessionSecondaryModelWarningContract } from './session/secondaryModelWarning.js';
-import { sessionSkillCatalogContract } from './session/skillCatalog.js';
+import { sessionSkillCatalogContract } from './session/skills.js';
 import { workspaceDirsContract } from './session/workspaceDirs.js';
 import { workspaceTrustContract } from './session/workspaceTrust.js';
 
@@ -75,6 +76,7 @@ export const globalContract: KlientContract = {
   authSummaryService: authSummaryContract,
   flagService: flagsContract,
   pluginService: pluginsContract,
+  capabilityService: capabilitiesContract,
   hostFolderBrowser: hostFsContract,
   bootstrapService: envContract,
   eventService: eventServiceContract,
@@ -105,7 +107,7 @@ export const globalContract: KlientContract = {
   agentGoalService: agentGoalContract,
   agentMcpService: agentMcpContract,
   agentShellCommandService: agentShellCommandContract,
-  agentContextSizeService: agentContextSizeContract,
+  agentTokenCountingService: agentContextSizeContract,
   agentContextMemoryService: agentContextMemoryContract,
   agentProfileService: agentProfileContract,
   agentSwarmService: agentSwarmContract,
