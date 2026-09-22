@@ -1,20 +1,3 @@
-/**
- * `mcpCore` domain — MCP server configuration schemas.
- *
- * Owns the `McpServerConfig` schema and its transport variants. These describe
- * the shape of MCP server entries as they appear in configuration (whether in
- * `config.toml` or an MCP-specific config file). The optional `scope` field
- * selects the connection lifetime: `'workspace'` (the default) shares one
- * connection across every session of the workspace; `'session'` opts the
- * server into per-session connections owned by the `sessionMcp` domain.
- *
- * Remote variants accept `auth: "oauth"`, mirroring v1: OAuth is still
- * discovered from a remote server's 401 response; the flag records that the
- * user explicitly chose OAuth, so static `headers` on the same entry are
- * treated as plain request headers (capability/identity declarations) rather
- * than as the server's credentials.
- */
-
 import { z } from 'zod';
 
 const StringRecordSchema = z.record(z.string(), z.string());
@@ -25,6 +8,7 @@ export const McpTimeoutMsSchema = z.number().int().min(1).max(MAX_MCP_TIMEOUT_MS
 const McpServerCommonFields = {
   enabled: z.boolean().optional(),
   scope: z.enum(['workspace', 'session']).optional(),
+  deferred: z.boolean().optional(),
   startupTimeoutMs: McpTimeoutMsSchema.optional(),
   toolTimeoutMs: McpTimeoutMsSchema.optional(),
   enabledTools: z.array(z.string()).optional(),
@@ -38,6 +22,7 @@ export const McpServerStdioConfigSchema = z.object({
   env: StringRecordSchema.optional(),
   cwd: z.string().optional(),
   executor: z.enum(['local', 'kaos']).optional(),
+  runtime_id: z.string().min(1).optional(),
   ...McpServerCommonFields,
 });
 

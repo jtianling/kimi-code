@@ -1,3 +1,4 @@
+import { log } from '#/logging/index';
 /**
  * Per-live-session event/interaction wiring for the v2 client.
  *
@@ -27,24 +28,24 @@
  *    kernel's `respond` no-ops on an id that is no longer pending, so a late
  *    answer after a turn cancellation is safe.
  */
+import {
+  MAIN_AGENT_ID,
+  type Event2,
+  type IDisposable,
+  type Interaction,
+} from '@moonshot-ai/agent-core-v2';
+import type { Event } from '@moonshot-ai/agent-core-v2/events';
+import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
+import type { AgentHandle, SessionHandle } from '@moonshot-ai/klient';
+
 import type {
   ApprovalRequest,
   ApprovalResponse,
-  Event,
   QuestionRequest,
   QuestionResult,
   ToolCallRequest,
   ToolCallResponse,
-  ToolInputDisplay,
-} from '@moonshot-ai/agent-core';
-import {
-  MAIN_AGENT_ID,
-  type DomainEvent,
-  type IDisposable,
-  type Interaction,
-} from '@moonshot-ai/agent-core-v2';
-import type { AgentHandle, SessionHandle } from '@moonshot-ai/klient';
-
+} from '#/interaction';
 import { translateDomainEvent } from '#/v2/event-mapper';
 
 /**
@@ -63,7 +64,7 @@ export interface SessionEventSink {
 }
 
 /**
- * The v2 approval payload (`agent-core-v2/src/session/approval/approval.ts` —
+ * The v2 approval payload (`agent-core-v2/src/agent/interaction/approval.ts` —
  * the package index exports only the service identifier, not the model). A
  * superset of v1's `ApprovalRequest`: the extra id/sessionId/agentId fields
  * are stripped when the handler is fed.
@@ -79,7 +80,7 @@ interface ApprovalInteractionPayload {
   readonly display: ToolInputDisplay;
 }
 
-/** The v2 question payload (`agent-core-v2/src/session/question/question.ts`). */
+/** The v2 question payload (`agent-core-v2/src/agent/interaction/question.ts`). */
 interface QuestionInteractionPayload {
   readonly id?: string;
   readonly turnId?: number;
@@ -97,8 +98,8 @@ interface UserToolInteractionPayload {
 
 export class SessionEventWiring {
   private readonly disposables: IDisposable[] = [];
-  private readonly agentSubscriptions = new Map<string, IDisposable>();
   /** Per-agent serialization tail — see enqueueAgentEvent. */
+  private readonly agentHandles = new Map<string, AgentHandle>();
   private readonly agentEventChains = new Map<string, Promise<void>>();
   /** Pending interactions already handed to the sink (the kernel re-fires the full pending set on every change). */
   private readonly bridgedInteractionIds = new Set<string>();
@@ -113,14 +114,29 @@ export class SessionEventWiring {
       this.session.events.on('interactions.changed', (pending) => {
         void this.bridgeNewPendingInteractions(pending);
       }),
-      this.session.events.on('metadata.changed', () => {
-        void this.syncAgents();
+      this.session.events.on('agents.raw', ({ agentId, event }) => {
+        const agent = this.agentHandles.get(agentId) ?? this.session.agent(agentId);
+        this.agentHandles.set(agentId, agent);
+        this.enqueueAgentEvent(agent, agentId, event as unknown as Event2<any>);
+      }),
+      this.session.events.on('interactions.resolved', ({ id }) => {
+        this.bridgedInteractionIds.delete(id);
+      }),
+      this.session.events.onError((error) => {
+        log.warn('Session event subscription failed', {
+          sessionId,
+          error: String(error),
+        });
       }),
     );
     // Baselines: catch interactions parked and agents created before this
     // wiring attached (e.g. a resumed session with a pending approval).
-    void this.bridgeNewPendingInteractions();
-    void this.syncAgents();
+    void this.bridgeNewPendingInteractions().catch((error) => {
+      log.warn('Session interaction baseline failed', {
+        sessionId,
+        error: String(error),
+      });
+    });
   }
 
   dispose(): void {
@@ -129,48 +145,8 @@ export class SessionEventWiring {
     for (const disposable of this.disposables) {
       disposable.dispose();
     }
-    for (const subscription of this.agentSubscriptions.values()) {
-      subscription.dispose();
-    }
-    this.agentSubscriptions.clear();
     this.agentEventChains.clear();
-  }
-
-  // ── agent discovery ───────────────────────────────────────────────────────
-
-  /**
-   * The wire has no agent-lifecycle stream; the metadata registry (surfaced
-   * through `metadata.changed` + `agents()`) is the discovery channel. The
-   * initial call doubles as the attach baseline.
-   */
-  private async syncAgents(): Promise<void> {
-    if (this.disposed) return;
-    const agents = await this.session.agents();
-    if (this.disposed) return;
-    for (const agentId of Object.keys(agents)) {
-      this.attachAgent(agentId);
-    }
-    for (const agentId of Array.from(this.agentSubscriptions.keys())) {
-      if (!(agentId in agents)) this.detachAgent(agentId);
-    }
-  }
-
-  private attachAgent(agentId: string): void {
-    if (this.disposed || this.agentSubscriptions.has(agentId)) return;
-    const handle = this.session.agent(agentId);
-    this.agentSubscriptions.set(
-      agentId,
-      handle.events.on('events.raw', (event) => {
-        this.enqueueAgentEvent(handle, agentId, event as DomainEvent);
-      }),
-    );
-  }
-
-  private detachAgent(agentId: string): void {
-    const subscription = this.agentSubscriptions.get(agentId);
-    if (subscription === undefined) return;
-    this.agentSubscriptions.delete(agentId);
-    subscription.dispose();
+    this.agentHandles.clear();
   }
 
   // ── event forwarding ──────────────────────────────────────────────────────
@@ -181,22 +157,34 @@ export class SessionEventWiring {
    * is async over the facade — chain per agent so a slow snapshot cannot
    * overtake (or be overtaken by) later events.
    */
-  private enqueueAgentEvent(agent: AgentHandle, agentId: string, event: DomainEvent): void {
+  private enqueueAgentEvent(
+    agent: AgentHandle,
+    agentId: string,
+    event: Event2<any>,
+  ): void {
     const previous = this.agentEventChains.get(agentId) ?? Promise.resolve();
     const next = previous.then(() => this.processAgentEvent(agent, agentId, event));
     this.agentEventChains.set(
       agentId,
-      next.catch(() => undefined),
+      next.catch((error) => {
+        log.warn('Session event forwarding failed', {
+          sessionId: this.sessionId,
+          agentId,
+          error: String(error),
+        });
+      }),
     );
   }
 
   private async processAgentEvent(
     agent: AgentHandle,
     agentId: string,
-    event: DomainEvent,
+    event: Event2<any>,
   ): Promise<void> {
     const enriched =
-      event.type === 'agent.status.updated' ? await this.withStatusSnapshot(agent, event) : event;
+      event.type === 'agent.status.updated'
+        ? await this.withStatusSnapshot(agent, event)
+        : event;
     const translated = translateDomainEvent(enriched, this.sessionId, agentId);
     if (translated !== undefined && !this.disposed) this.sink.receiveEvent(translated);
   }
@@ -211,7 +199,10 @@ export class SessionEventWiring {
    * Missing reads (dead agent scope, mid-teardown) drop the enrichment for
    * that event instead of failing the stream.
    */
-  private async withStatusSnapshot(agent: AgentHandle, event: DomainEvent): Promise<DomainEvent> {
+  private async withStatusSnapshot(
+    agent: AgentHandle,
+    event: Event2<any>,
+  ): Promise<Event2<any>> {
     const [usage, contextTokens, capabilities, model] = await Promise.all([
       agent.getUsage().catch(() => undefined),
       agent.getStatusContextSize().catch(() => undefined),
@@ -219,18 +210,31 @@ export class SessionEventWiring {
       agent.getModel().catch(() => undefined),
     ]);
     if (usage === undefined || contextTokens === undefined) return event;
+    const maxContextTokens =
+      capabilities?.max_input_tokens ?? capabilities?.max_context_tokens;
+    const contextUsage =
+      Number.isFinite(contextTokens) &&
+      maxContextTokens !== undefined &&
+      Number.isFinite(maxContextTokens) &&
+      maxContextTokens > 0
+        ? contextTokens / maxContextTokens
+        : undefined;
     return {
       ...event,
       usage,
+      contextUsage,
       contextTokens,
-      maxContextTokens: capabilities?.max_input_tokens ?? capabilities?.max_context_tokens,
+      maxContextTokens:
+        capabilities?.max_input_tokens ?? capabilities?.max_context_tokens,
       model,
-    } as unknown as DomainEvent;
+    } as unknown as Event2<any>;
   }
 
   // ── interaction bridge ────────────────────────────────────────────────────
 
-  private async bridgeNewPendingInteractions(pending?: readonly Interaction[]): Promise<void> {
+  private async bridgeNewPendingInteractions(
+    pending?: readonly Interaction[],
+  ): Promise<void> {
     if (this.disposed) return;
     const list = pending ?? (await this.session.interactions.list());
     for (const interaction of list) {
@@ -267,7 +271,12 @@ export class SessionEventWiring {
         action: payload.action,
         display: payload.display,
         sessionId: this.sessionId,
-        agentId: payload.agentId ?? interaction.origin.agentId ?? MAIN_AGENT_ID,
+        agentId:
+          payload.agentId ??
+          (typeof interaction.tags['agentId'] === 'string'
+            ? interaction.tags['agentId']
+            : undefined) ??
+          MAIN_AGENT_ID,
       });
       await this.session.approvals.decide(interaction.id, response);
     } catch {
@@ -290,7 +299,10 @@ export class SessionEventWiring {
         toolCallId: payload.toolCallId,
         questions: payload.questions,
         sessionId: this.sessionId,
-        agentId: interaction.origin.agentId ?? MAIN_AGENT_ID,
+        agentId:
+          (typeof interaction.tags['agentId'] === 'string'
+            ? interaction.tags['agentId']
+            : undefined) ?? MAIN_AGENT_ID,
       });
       if (result === null) {
         await this.session.questions.dismiss(interaction.id);

@@ -13,7 +13,7 @@ import { z } from 'zod';
 
 import { noResult } from '../helpers.js';
 import type { ServiceContract } from '../types.js';
-import { permissionModeSchema } from './rpc.js';
+import { permissionModeSchema } from './schemas.js';
 
 export const agentPermissionModeContract = {
   mode: { input: z.tuple([]), output: permissionModeSchema },

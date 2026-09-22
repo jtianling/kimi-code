@@ -1,7 +1,11 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach,describe,expect,it } from 'vitest';
 
-import { ErrorCodes, Error2 } from '#/errors';
-import { buildMcpHttpHeaders, HttpMcpClient, isTerminalTransportError } from '#/mcpCore/client-http';
+import { Error2,ErrorCodes } from '#/errors';
+import {
+  buildMcpHttpHeaders,
+  HttpMcpClient,
+  isTerminalTransportError,
+} from '#/mcpCore/client-http';
 
 import { startInProcessHttpMcpServer } from './stubs';
 

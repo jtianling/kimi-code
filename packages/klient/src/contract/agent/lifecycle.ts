@@ -10,7 +10,7 @@
 import { z } from 'zod';
 
 import type { ServiceContract } from '../types.js';
-import { handleWireSchema } from '../session/lifecycle.js';
+const handleWireSchema = z.object({ agentId: z.string() });
 
 /** `CreateAgentOptions` — only the slices a wire caller may pass. */
 export const createAgentOptionsSchema = z.object({

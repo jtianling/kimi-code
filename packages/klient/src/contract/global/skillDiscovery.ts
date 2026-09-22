@@ -1,8 +1,8 @@
 /**
  * `skillDiscovery` (app scope) — stateless skill scanning over caller-supplied
- * roots. Mirrors `agent-core-v2/app/skillCatalog/skillDiscovery.ts` and the
+ * roots. Mirrors `agent-core-v2/features/skill/catalog/skillDiscovery.ts` and the
  * `SkillRoot` / `SkillDefinition` / `SkippedSkill` types in
- * `agent-core-v2/app/skillCatalog/types.ts`. `SkillMetadata` is an open
+ * `agent-core-v2/features/skill/catalog/types.ts`. `SkillMetadata` is an open
  * front-matter map; mirrored loosely. The `SkillDefinition.content` (full
  * skill body) crosses the wire verbatim.
  */
@@ -17,14 +17,14 @@ const skillPluginContextSchema = z.looseObject({
   id: z.string(),
 });
 
-/** `SkillRoot` (`agent-core-v2/app/skillCatalog/types.ts`). */
+/** `SkillRoot` (`agent-core-v2/features/skill/catalog/types.ts`). */
 export const skillRootSchema = z.object({
   path: z.string(),
   source: skillSourceSchema,
   plugin: skillPluginContextSchema.optional(),
 });
 
-/** `SkillMetadata` — open front-matter map (`agent-core-v2/app/skillCatalog/types.ts`). */
+/** `SkillMetadata` — open front-matter map (`agent-core-v2/features/skill/catalog/types.ts`). */
 export const skillMetadataSchema = z.looseObject({
   name: z.string().optional(),
   description: z.string().optional(),
@@ -36,7 +36,7 @@ export const skillMetadataSchema = z.looseObject({
   arguments: z.union([z.array(z.unknown()), z.string()]).optional(),
 });
 
-/** `SkillDefinition` (`agent-core-v2/app/skillCatalog/types.ts`). */
+/** `SkillDefinition` (`agent-core-v2/features/skill/catalog/types.ts`). */
 export const skillDefinitionSchema = z.object({
   name: z.string(),
   description: z.string(),
@@ -48,18 +48,19 @@ export const skillDefinitionSchema = z.object({
   plugin: skillPluginContextSchema.optional(),
 });
 
-/** `SkippedSkill` (`agent-core-v2/app/skillCatalog/types.ts`). */
+/** `SkippedSkill` (`agent-core-v2/features/skill/catalog/types.ts`). */
 export const skippedSkillSchema = z.object({
   path: z.string(),
   type: z.string(),
   reason: z.string(),
 });
 
-/** `SkillDiscoveryResult` (`agent-core-v2/app/skillCatalog/skillDiscovery.ts`). */
+/** `SkillDiscoveryResult` (`agent-core-v2/features/skill/catalog/skillDiscovery.ts`). */
 export const skillDiscoveryResultSchema = z.object({
   skills: z.array(skillDefinitionSchema),
   skipped: z.array(skippedSkillSchema),
   scannedRoots: z.array(z.string()),
+  scannedDirectories: z.array(z.string()),
 });
 
 export const skillDiscoveryContract = {

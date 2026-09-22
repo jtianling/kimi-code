@@ -1,3 +1,6 @@
+import type { SessionActivityState } from '@moonshot-ai/agent-core-v2/session/sessionActivity/sessionActivity';
+import type { GlobalMcpServerConfig } from '@moonshot-ai/agent-core-v2/app/mcpManagement/mcpManagement';
+import { RPCError } from '../errors.js';
 /**
  * The session facade — one `klient.session(id)` handle aggregating the
  * session-scope services (metadata, activity, approvals, questions,
@@ -10,43 +13,38 @@
  * agent-lifecycle channel exists on the wire).
  */
 
-import type { AgentActivityState } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
-import type { IAgentMcpService } from '@moonshot-ai/agent-core-v2/agent/mcp/mcp';
-import { SECONDARY_MODEL_SECTION } from '@moonshot-ai/agent-core-v2/app/kosongConfig/configSection';
-import type { SessionWarning } from '@moonshot-ai/agent-core-v2/app/sessionLegacy/sessionProtocol';
-import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
-import type { ISessionCronService } from '@moonshot-ai/agent-core-v2/session/cron/sessionCronService';
-import type { SecondaryModelWarning } from '@moonshot-ai/agent-core-v2/session/subagent/secondaryModelWarning';
-import type { IWorkspaceDirs } from '@moonshot-ai/agent-core-v2/workspace/workspaceDirs/workspaceDirs';
 import type {
   ApprovalRequest,
   ApprovalResponse,
-} from '@moonshot-ai/agent-core-v2/session/approval/approval';
-import type {
-  Interaction,
-  InteractionKind,
-} from '@moonshot-ai/agent-core-v2/session/interaction/interaction';
+} from '@moonshot-ai/agent-core-v2/agent/interaction/approval';
 import type {
   QuestionRequest,
   QuestionResult,
-} from '@moonshot-ai/agent-core-v2/session/question/question';
+} from '@moonshot-ai/agent-core-v2/agent/interaction/question';
+import type { IAgentMcpService } from '@moonshot-ai/agent-core-v2/agent/mcp/mcp';
+import type { SessionWarning } from '@moonshot-ai/agent-core-v2/app/sessionLegacy/sessionProtocol';
+import type { IAgentCronService } from '@moonshot-ai/agent-core-v2/features/cron/cronService';
+import type { SkillSummary } from '@moonshot-ai/agent-core-v2/features/skill/catalog/types';
+import type {
+  Interaction,
+  InteractionKind,
+} from '@moonshot-ai/agent-core-v2/human/interaction/interaction';
 import type {
   AgentMeta,
   SessionMeta,
   SessionMetaPatch,
 } from '@moonshot-ai/agent-core-v2/session/sessionMetadata/sessionMetadata';
+import type { IWorkspaceDirs } from '@moonshot-ai/agent-core-v2/workspace/workspaceDirs/workspaceDirs';
 
-import type { ScopeRef } from '../channel.js';
 import type { McpServerConfig } from '../../contract/mcp.js';
-import { RPCError } from '../errors.js';
+import type { ScopeRef } from '../channel.js';
 import type { ScopedCaller } from './global.js';
 
 const NOT_FOUND = 40404;
-const REQUEST_INVALID = 40001;
 
 export type { ScopedCaller } from './global.js';
 
-/** What `sessionLifecycleService.create/fork/createChild` leaves on the wire. */
+/** What `sessionLifecycleService.create` and `sessionManager.restore` leave on the wire. */
 interface HandleWire {
   readonly id: string;
 }
@@ -88,12 +86,15 @@ export interface SessionSkillsFacade {
 }
 
 /**
- * Derived session lifecycle phase. The engine retired its `sessionActivity`
- * service (#1751) — busy is now derived from agent activity views — so the
- * facade composes the phase from the pending interaction lists and each
- * agent's `agentActivityView`, keeping the retired service's precedence.
+ * Derived session lifecycle phase. The facade reads the engine's session
+ * activity view (busy + pending interaction) and maps it onto the v1
+ * precedence: pending approvals and questions first, then busy, then idle.
  */
-export type SessionStatus = 'running' | 'idle' | 'awaiting_approval' | 'awaiting_question';
+export type SessionStatus =
+  | 'running'
+  | 'idle'
+  | 'awaiting_approval'
+  | 'awaiting_question';
 
 export type { SessionWarning };
 
@@ -112,15 +113,35 @@ export interface McpStartupMetrics {
 /** What `IWorkspaceDirs.addDir` leaves on the wire. */
 export type AddAdditionalDirResult = Awaited<ReturnType<IWorkspaceDirs['addDir']>>;
 
-/** One cron task as `ISessionCronService.list` reports it. */
-export type CronTask = Awaited<ReturnType<ISessionCronService['list']>>[number];
+/** One cron task as `IAgentCronService.list` reports it. */
+export type CronTask = Awaited<ReturnType<IAgentCronService['list']>>[number];
 
 /** v1's `CronTaskSnapshot` — the task plus its post-jitter next fire time. */
 export type CronTaskSnapshot = CronTask & { readonly nextFireAt: number | null };
 
 export interface SessionFacade {
+  activityState(): Promise<SessionActivityState>;
+  cancelInit(): Promise<void>;
+  replaceMcpServer(name: string, config: GlobalMcpServerConfig): Promise<void>;
+  addMcpServer(
+    config: GlobalMcpServerConfig,
+    persist?: boolean,
+  ): Promise<McpServerInfo>;
   get(): Promise<SessionMeta>;
   setTitle(title: string): Promise<void>;
+  /**
+   * Generate and apply a title from the main agent's first prompts via the
+   * managed `chat_title` tool. `undefined` when generation is unavailable
+   * (no managed OAuth login, no prompt yet, or a custom title is set).
+   * `force` regenerates anyway, overwriting a generated or custom title.
+   * `source` picks the conversation excerpt: `user_prompts` (default),
+   * `first_turn` (opening prompt + first reply; strict), or `digest`
+   * (head+tail of a multi-turn conversation).
+   */
+  generateTitle(opts?: {
+    force?: boolean;
+    source?: 'user_prompts' | 'first_turn' | 'digest';
+  }): Promise<string | undefined>;
   update(patch: SessionMetaPatch): Promise<void>;
   setArchived(archived: boolean): Promise<void>;
   status(): Promise<SessionStatus>;
@@ -140,6 +161,7 @@ export interface SessionFacade {
   isLive(): Promise<boolean>;
   fork(input?: {
     newSessionId?: string;
+    turnIndex?: number;
     title?: string;
     metadata?: Record<string, unknown>;
   }): Promise<SessionMeta>;
@@ -171,7 +193,10 @@ export interface SessionFacade {
    * handler (`IWorkspaceDirs`, workspace scope — resolved like close/archive).
    * `persist` defaults to the engine default (`true` → `.kimi-code/local.toml`).
    */
-  addAdditionalDir(path: string, options?: { persist?: boolean }): Promise<AddAdditionalDirResult>;
+  addAdditionalDir(
+    path: string,
+    options?: { persist?: boolean },
+  ): Promise<AddAdditionalDirResult>;
   /**
    * Cron tasks of this session with their post-jitter next fire times
    * (mirrors the v1 SDK `Session.getCronTasks`). The schedule expression is
@@ -184,9 +209,7 @@ export interface SessionFacade {
    * `Session.applyPersistedSecondaryModel`). Throws when no secondary model
    * is persisted or its recipe is unknown.
    */
-  applyPersistedSecondaryModel(): Promise<void>;
   /** Re-run the secondary-model warning check against the live config. */
-  recheckSecondaryModelWarning(): Promise<void>;
   /** Merged skill view of the session (builtin + user + project + plugin). */
   listSkills(): Promise<readonly SkillSummary[]>;
   /** The session's path layout and workspace view (live sessions only). */
@@ -215,82 +238,75 @@ export interface SessionFacade {
   agents(): Promise<Readonly<Record<string, AgentMeta>>>;
 }
 
-export function createSessionFacade(call: ScopedCaller, sessionId: string): SessionFacade {
+export function createSessionFacade(
+  call: ScopedCaller,
+  sessionId: string,
+): SessionFacade {
   const scope: ScopeRef = { sessionId };
-  const read = (): Promise<SessionMeta> =>
-    call(scope, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
-  // Session lifecycle methods live on the session's workspace handler
-  // (Workspace scope) — the index supplies the handler's workspaceId.
   const resolveWorkspaceId = async (): Promise<string | undefined> => {
     const summary = (await call({}, 'sessionIndex', 'get', [sessionId])) as
       | { workspaceId: string }
       | undefined;
     return summary?.workspaceId;
   };
+  const read = (): Promise<SessionMeta> =>
+    call(scope, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
   const spawn = async (
     method: 'fork' | 'createChild',
-    input: { newSessionId?: string; title?: string; metadata?: Record<string, unknown> } = {},
+    input: {
+      newSessionId?: string;
+      title?: string;
+      metadata?: Record<string, unknown>;
+      turnIndex?: number;
+    } = {},
   ): Promise<SessionMeta> => {
-    const workspaceId = await resolveWorkspaceId();
-    if (workspaceId === undefined) {
-      throw new RPCError(NOT_FOUND, `session not found: ${sessionId}`);
-    }
-    const handle = (await call({ workspaceId }, 'sessionLifecycleService', method, [
+    return call({}, 'sessionManager', method, [
       {
         sourceSessionId: sessionId,
         newSessionId: input.newSessionId,
+        turnIndex: input.turnIndex,
         title: input.title,
         metadata: input.metadata,
       },
-    ])) as HandleWire;
-    return call({ sessionId: handle.id }, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
+    ]) as Promise<SessionMeta>;
   };
 
   return {
     get: read,
-    setTitle: (title) => call(scope, 'sessionMetadata', 'setTitle', [title]) as Promise<void>,
-    update: (patch) => call(scope, 'sessionMetadata', 'update', [patch]) as Promise<void>,
+    activityState: () =>
+      call(scope, 'sessionActivityView', 'state', []) as Promise<SessionActivityState>,
+    replaceMcpServer: (name, config) =>
+      call(scope, 'sessionMcpManagement', 'replace', [name, config]) as Promise<void>,
+    addMcpServer: (config, persist) =>
+      call(scope, 'sessionMcpManagement', 'add', [
+        config,
+        persist,
+      ]) as Promise<McpServerInfo>,
+    cancelInit: () =>
+      call(scope, 'sessionInitService', 'cancelInit', []) as Promise<void>,
+    setTitle: (title) =>
+      call(scope, 'sessionMetadata', 'setTitle', [title]) as Promise<void>,
+    generateTitle: (opts) =>
+      call(scope, 'sessionTitleService', 'generateTitle', [opts]) as Promise<
+        string | undefined
+      >,
+    update: (patch) =>
+      call(scope, 'sessionMetadata', 'update', [patch]) as Promise<void>,
     setArchived: (archived) =>
       call(scope, 'sessionMetadata', 'setArchived', [archived]) as Promise<void>,
     status: async () => {
-      const pending = (kind: 'approval' | 'question') =>
-        call(scope, 'sessionInteractionService', 'listPending', [kind]) as Promise<
-          readonly unknown[]
-        >;
-      if ((await pending('approval')).length > 0) return 'awaiting_approval';
-      if ((await pending('question')).length > 0) return 'awaiting_question';
-      const meta = await read();
-      for (const agentId of Object.keys(meta.agents ?? {})) {
-        try {
-          const state = (await call(
-            { sessionId, agentId },
-            'agentActivityView',
-            'state',
-            [],
-          )) as AgentActivityState;
-          if (state.turn !== undefined || state.background.length > 0) return 'running';
-        } catch {
-          // Agents stay registered after their live handle is gone; the scope
-          // probe fails for a dead agent, so treat it as not active — the same
-          // view the retired service had from iterating live handles only.
-        }
-      }
-      return 'idle';
+      const activity = (await call(scope, 'sessionActivityView', 'state', [])) as {
+        readonly busy: boolean;
+        readonly pendingInteraction: 'none' | 'approval' | 'question';
+      };
+      if (activity.pendingInteraction === 'approval') return 'awaiting_approval';
+      if (activity.pendingInteraction === 'question') return 'awaiting_question';
+      return activity.busy ? 'running' : 'idle';
     },
-    close: async () => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) return;
-      await call({ workspaceId }, 'sessionLifecycleService', 'close', [sessionId]);
-    },
-    archive: async () => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) return;
-      await call({ workspaceId }, 'sessionLifecycleService', 'archive', [sessionId]);
-    },
+    close: () => call({}, 'sessionManager', 'close', [sessionId]) as Promise<void>,
+    archive: () => call({}, 'sessionManager', 'archive', [sessionId]) as Promise<void>,
     restore: async (opts) => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) return false;
-      const handle = (await call({ workspaceId }, 'sessionLifecycleService', 'restore', [
+      const handle = (await call({}, 'sessionManager', 'restore', [
         sessionId,
         opts,
       ])) as HandleWire | null | undefined;
@@ -299,27 +315,20 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
       return handle !== null && handle !== undefined;
     },
     delete: async () => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) {
-        throw new RPCError(NOT_FOUND, `session not found: ${sessionId}`);
-      }
-      await call({ workspaceId }, 'sessionLifecycleService', 'delete', [sessionId]);
+      await call({}, 'sessionManager', 'delete', [sessionId]);
     },
     resume: async (options) => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) return false;
-      const handle = (await call({ workspaceId }, 'sessionLifecycleService', 'resume', [
+      const handle = (await call({}, 'sessionManager', 'resume', [
         sessionId,
         options,
       ])) as HandleWire | null | undefined;
       return handle !== null && handle !== undefined;
     },
     isLive: async () => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) return false;
-      const handle = (await call({ workspaceId }, 'sessionLifecycleService', 'get', [
-        sessionId,
-      ])) as HandleWire | null | undefined;
+      const handle = (await call({}, 'sessionManager', 'get', [sessionId])) as
+        | HandleWire
+        | null
+        | undefined;
       return handle !== null && handle !== undefined;
     },
     fork: (input) => spawn('fork', input),
@@ -335,24 +344,8 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
       await call({ sessionId, agentId: 'main' }, 'agentProfileService', 'data', []);
       return call(scope, 'sessionBtwService', 'start', []) as Promise<string>;
     },
-    getSessionWarnings: async () => {
-      // `agentId: 'main'` scope resolution materializes the main agent — the
-      // same `ensureMainAgent` the server's warnings route performs.
-      const [agentsMdWarning, secondary] = await Promise.all([
-        call({ sessionId, agentId: 'main' }, 'agentProfileService', 'getAgentsMdWarning', []) as
-          Promise<string | undefined>,
-        call(scope, 'sessionSecondaryModelWarningService', 'getSecondaryModelWarning', []) as
-          Promise<SecondaryModelWarning | undefined>,
-      ]);
-      const warnings: SessionWarning[] = [];
-      if (agentsMdWarning !== undefined) {
-        warnings.push({ code: 'agents-md-oversized', message: agentsMdWarning, severity: 'warning' });
-      }
-      if (secondary !== undefined) {
-        warnings.push({ code: secondary.code, message: secondary.message, severity: 'warning' });
-      }
-      return warnings;
-    },
+    getSessionWarnings: () =>
+      call(scope, 'sessionWarnings', 'get', []) as Promise<readonly SessionWarning[]>,
     listMcpServers: () =>
       call({ sessionId, agentId: 'main' }, 'agentMcpService', 'list', []) as Promise<
         readonly McpServerInfo[]
@@ -360,8 +353,12 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
     getMcpStartupMetrics: async () => {
       const mcpScope: ScopeRef = { sessionId, agentId: 'main' };
       await call(mcpScope, 'agentMcpService', 'waitForInitialLoad', []);
-      const durationMs = (await call(mcpScope, 'agentMcpService', 'initialLoadDurationMs', [])) as
-        number;
+      const durationMs = (await call(
+        mcpScope,
+        'agentMcpService',
+        'initialLoadDurationMs',
+        [],
+      )) as number;
       return { durationMs };
     },
     addAdditionalDir: async (path, options) => {
@@ -374,49 +371,36 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
       ]) as Promise<AddAdditionalDirResult>;
     },
     getCronTasks: async () => {
-      const tasks = (await call(scope, 'sessionCronService', 'list', [])) as readonly CronTask[];
+      const tasks = (await call(
+        { sessionId, agentId: 'main' },
+        'agentCronService',
+        'list',
+        [],
+      )) as readonly CronTask[];
       const snapshots = await Promise.all(
         tasks.map(async (task) => ({
           ...task,
-          nextFireAt: (await call(scope, 'sessionCronService', 'getNextFireForTask', [
-            task.id,
-          ])) as number | null,
+          nextFireAt: (await call(
+            { sessionId, agentId: 'main' },
+            'agentCronService',
+            'getNextFireForTask',
+            [task.id],
+          )) as number | null,
         })),
       );
       return { tasks: snapshots };
     },
-    applyPersistedSecondaryModel: async () => {
-      await call({}, 'configService', 'reload', []);
-      const secondary = (await call({}, 'configService', 'get', [SECONDARY_MODEL_SECTION])) as
-        | { model?: string }
-        | undefined;
-      if (secondary?.model === undefined) {
-        throw new RPCError(
-          REQUEST_INVALID,
-          'Cannot apply the secondary model: persist its recipe before applying it to a session.',
-        );
-      }
-      // Recipe-level validation; deeper resolution problems surface through
-      // the rechecked warning below (readable via getSessionWarnings).
-      const recipe = (await call({}, 'modelService', 'get', [secondary.model])) as
-        | Record<string, unknown>
-        | null
-        | undefined;
-      if (recipe === undefined || recipe === null) {
-        throw new RPCError(NOT_FOUND, `secondary model not configured: ${secondary.model}`);
-      }
-      await call(scope, 'sessionSecondaryModelWarningService', 'recheckSecondaryModelWarning', []);
-    },
-    recheckSecondaryModelWarning: async () => {
-      await call(scope, 'sessionSecondaryModelWarningService', 'recheckSecondaryModelWarning', []);
-    },
     listSkills: () =>
-      call(scope, 'sessionSkillCatalog', 'list', []) as Promise<readonly SkillSummary[]>,
+      call(scope, 'sessionSkillCatalog', 'list', []) as Promise<
+        readonly SkillSummary[]
+      >,
     context: async () => {
       const [cwd, sessionDir, additionalDirs] = await Promise.all([
         call(scope, 'sessionContext', 'cwd', []) as Promise<string>,
         call(scope, 'sessionContext', 'sessionDir', []) as Promise<string>,
-        call(scope, 'sessionWorkspaceContext', 'additionalDirs', []) as Promise<readonly string[]>,
+        call(scope, 'sessionWorkspaceContext', 'additionalDirs', []) as Promise<
+          readonly string[]
+        >,
       ]);
       return { cwd, sessionDir, additionalDirs };
     },
@@ -426,13 +410,20 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
       await call(scope, 'agentLifecycleService', 'create', [{ agentId }]);
     },
     listLiveAgents: async () => {
-      const handles = (await call(scope, 'agentLifecycleService', 'list', [])) as readonly {
-        id: string;
+      const handles = (await call(
+        scope,
+        'agentLifecycleService',
+        'list',
+        [],
+      )) as readonly {
+        agentId: string;
       }[];
-      return handles.map((handle) => handle.id);
+      return handles.map((handle) => handle.agentId);
     },
     reconnectMcpServer: async (name) => {
-      await call({ sessionId, agentId: 'main' }, 'agentMcpService', 'reconnect', [name]);
+      await call({ sessionId, agentId: 'main' }, 'agentMcpService', 'reconnect', [
+        name,
+      ]);
     },
 
     approvals: {
@@ -441,7 +432,10 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
           readonly ApprovalRequest[]
         >,
       decide: (id, response) =>
-        call(scope, 'sessionApprovalService', 'decide', [id, response]) as Promise<void>,
+        call(scope, 'sessionApprovalService', 'decide', [
+          id,
+          response,
+        ]) as Promise<void>,
     },
 
     questions: {
@@ -451,7 +445,8 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
         >,
       answer: (id, result) =>
         call(scope, 'sessionQuestionService', 'answer', [id, result]) as Promise<void>,
-      dismiss: (id) => call(scope, 'sessionQuestionService', 'dismiss', [id]) as Promise<void>,
+      dismiss: (id) =>
+        call(scope, 'sessionQuestionService', 'dismiss', [id]) as Promise<void>,
     },
 
     interactions: {
@@ -460,12 +455,17 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
           readonly Interaction[]
         >,
       respond: (id, response) =>
-        call(scope, 'sessionInteractionService', 'respond', [id, response]) as Promise<void>,
+        call(scope, 'sessionInteractionService', 'respond', [
+          id,
+          response,
+        ]) as Promise<void>,
     },
 
     skills: {
       list: () =>
-        call(scope, 'sessionSkillCatalog', 'list', []) as Promise<readonly SkillSummary[]>,
+        call(scope, 'sessionSkillCatalog', 'list', []) as Promise<
+          readonly SkillSummary[]
+        >,
     },
 
     agents: async () => {

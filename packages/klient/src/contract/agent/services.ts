@@ -1,8 +1,9 @@
 /**
- * Agent-scope domain service contracts. These mirror the positional-arg
- * signatures of the engine's domain Services (shellCommand / profile / usage /
- * plan / task) that the agent facade calls directly; payload and result
- * schemas are shared with `agent/rpc.ts` (they mirror the same wire shapes).
+ * Agent-scope domain service contracts. These mirror the signatures of the
+ * engine's domain Services (prompt / skill / loop / permissionMode / command /
+ * contextMemory / tokenCounting / shellCommand / profile / usage / plan /
+ * task) that the agent facade calls directly; payload and result schemas are
+ * shared in `agent/schemas.ts` (they mirror the same wire shapes).
  */
 
 import { z } from 'zod';
@@ -10,13 +11,85 @@ import { z } from 'zod';
 import { maybe, noResult } from '../helpers.js';
 import type { ServiceContract } from '../types.js';
 import {
+  activateSkillPayloadSchema,
+  agentCommandInfoSchema,
   agentTaskInfoSchema,
+  permissionModeSchema,
   planDataSchema,
+  promptLaunchResultSchema,
+  promptPayloadSchema,
+  promptWithSkillsPayloadSchema,
+  promptWithSkillsResultSchema,
   runShellCommandPayloadSchema,
+  runtimeBindingSchema,
   setModelResultSchema,
   shellCommandResultSchema,
+  steerPayloadSchema,
   usageStatusSchema,
-} from './rpc.js';
+} from './schemas.js';
+
+export const agentPromptContract = {
+  submit: {
+    input: z.tuple([promptPayloadSchema]),
+    output: maybe(promptLaunchResultSchema),
+  },
+  submitSteer: {
+    input: z.tuple([steerPayloadSchema]),
+    output: maybe(promptLaunchResultSchema),
+  },
+} satisfies ServiceContract;
+
+export const agentSkillContract = {
+  activate: {
+    input: z.tuple([activateSkillPayloadSchema]),
+    output: promptLaunchResultSchema,
+  },
+  promptWithSkills: {
+    input: z.tuple([promptWithSkillsPayloadSchema]),
+    output: promptWithSkillsResultSchema,
+  },
+} satisfies ServiceContract;
+
+export const agentLoopContract = {
+  snapshot: {
+    input: z.tuple([]),
+    output: z.looseObject({
+      state: z.enum(['idle', 'running']),
+      activeTurnId: z.number().optional(),
+      queue: z.array(z.unknown()),
+      notificationCount: z.number(),
+      paused: z.boolean(),
+      hasPendingRequests: z.boolean(),
+      turn: z.unknown().optional(),
+    }),
+  },
+  cancelFromUser: { input: z.tuple([z.number().optional()]), output: noResult },
+} satisfies ServiceContract;
+
+export const agentPermissionModeContract = {
+  mode: { input: z.tuple([]), output: permissionModeSchema },
+  setModeAndBroadcast: { input: z.tuple([permissionModeSchema]), output: noResult },
+} satisfies ServiceContract;
+
+export const agentCommandContract = {
+  list: { input: z.tuple([]), output: z.array(agentCommandInfoSchema) },
+  run: { input: z.tuple([z.string(), z.string().optional()]), output: noResult },
+} satisfies ServiceContract;
+
+export const agentRuntimeBindingContract = {
+  get: { input: z.tuple([]), output: runtimeBindingSchema },
+  set: { input: z.tuple([runtimeBindingSchema]), output: runtimeBindingSchema },
+  switch: { input: z.tuple([z.string()]), output: runtimeBindingSchema },
+} satisfies ServiceContract;
+
+/** `history` items are full `ContextMessage`s, mirrored as `unknown`. */
+export const agentContextMemoryContract = {
+  get: { input: z.tuple([]), output: z.array(z.unknown()) },
+} satisfies ServiceContract;
+
+export const agentTokenCountingContract = {
+  statusSize: { input: z.tuple([]), output: z.number() },
+} satisfies ServiceContract;
 
 export const agentShellCommandContract = {
   run: {
@@ -40,7 +113,7 @@ export const profileUpdateDataSchema = z.object({
   activeToolNames: z.array(z.string()).optional(),
 });
 
-/** `ModelCapability` (`agent-core-v2/kosong/contract/capability.ts`). */
+/** `ModelCapability` (`agent-core-v2/llm-adapter/contract/capability.ts`). */
 export const modelCapabilitySchema = z.object({
   image_in: z.boolean(),
   video_in: z.boolean(),
@@ -140,7 +213,7 @@ export const agentTaskContract = {
   },
 } satisfies ServiceContract;
 
-/** `SwarmModeTrigger` (`agent-core-v2/agent/swarm/swarm.ts`). */
+/** `SwarmModeTrigger` (`agent-core-v2/features/swarm/agent/swarm.ts`). */
 export const swarmModeTriggerSchema = z.enum(['manual', 'task', 'tool']);
 
 export const agentSwarmContract = {
@@ -163,6 +236,7 @@ export const fullCompactionInputSchema = z.object({
 });
 
 export const agentFullCompactionContract = {
+  cancel: { input: z.tuple([]), output: noResult },
   begin: { input: z.tuple([fullCompactionInputSchema]), output: z.boolean() },
   // Property read (`readonly compacting: FullCompactionTask | null`). The task
   // handle does not cross the wire meaningfully; consumers only null-check it.

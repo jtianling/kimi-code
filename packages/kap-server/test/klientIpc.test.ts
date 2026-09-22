@@ -1,22 +1,22 @@
-/**
- * klient IPC mount (`ServerStartOptions.klientIpc`) — proves the unix-socket
- * surface serves the SAME engine instance as the REST surface: a turn driven
- * end-to-end through the IPC klient (mock model endpoint, real pipeline) is
- * visible through the REST transcript of the same session.
- */
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import type { AddressInfo, Socket } from 'node:net';
-import { mkdtemp, rm } from 'node:fs/promises';
+
+import { mkdtemp,rm } from 'node:fs/promises';
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http';
+import type { AddressInfo,Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll,beforeAll,describe,expect,it } from 'vitest';
 
-import type { AgentHandle, Klient } from '@moonshot-ai/klient';
+import type { AgentHandle,Klient } from '@moonshot-ai/klient';
 import { createKlient } from '@moonshot-ai/klient/ipc';
 
-import { startServer, type RunningServer } from '../src/start';
+import { startServer,type RunningServer } from '../src/start';
 import { authedFetch } from './helpers/auth';
 import { TEST_HOST_IDENTITY } from './helpers/hostIdentity';
 
@@ -89,7 +89,7 @@ describe('kap-server klient IPC mount', () => {
     mockModel = createServer((req: IncomingMessage, res: ServerResponse) => {
       void (async () => {
         for await (const _chunk of req) {
-          // drain the request body
+
         }
         if (req.url === '/v1/chat/completions') chatCompletionsCalls += 1;
         res.writeHead(200, {
@@ -158,9 +158,9 @@ describe('kap-server klient IPC mount', () => {
     const agent = klient.session(session.id).agent('main');
     await agent.setModel(MODEL_ID);
 
-    // Attach the REST transcript store BEFORE the turn (same consumption
-    // pattern as the web inspector): the live store receives turn events as
-    // they happen, so the post-turn read does not depend on wire-flush timing.
+
+
+
     const transcriptUrl = `/api/v1/sessions/${session.id}/transcript?agent_id=main`;
     const base = `http://127.0.0.1:${server.port}`;
     await authedFetch(server, base, transcriptUrl);
@@ -176,8 +176,8 @@ describe('kap-server klient IPC mount', () => {
 
     expect(chatCompletionsCalls).toBeGreaterThan(0);
 
-    // Same-engine proof: the IPC-driven turn is readable through the REST
-    // transcript of the same session — the two surfaces share one engine.
+
+
     const deadline = Date.now() + 15_000;
     let body = '';
     for (;;) {

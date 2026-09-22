@@ -1,15 +1,5 @@
-/**
- * Scenario: per-session MCP connections — the Session-scope `SessionMcpService`
- * owns a private `McpConnectionManager` fed by the seeded `ISessionMcpServers`
- * projection: the initial connect consumes its snapshot, filtered change
- * events are applied incrementally after the initial connect settles, and
- * disposing the session service shuts the connections down.
- *
- * Exercises the real `SessionMcpService` against a stubbed
- * `ISessionMcpServers` seed and an in-process HTTP MCP server. Run:
- * `pnpm --filter @moonshot-ai/agent-core-v2 exec vitest run
- * test/session/sessionMcp/sessionMcp.test.ts`.
- */
+import { tmpdir } from 'node:os';
+import { stdioFixture } from '../../mcpCore/stubs';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -19,23 +9,48 @@ import {
   _clearScopedRegistryForTests,
   registerScopedService,
 } from '#/_base/di/scope';
-import { LifecycleScope } from '#/app/scopes';
 import { createScopedTestHost, createServices, stubPair } from '#/_base/di/test';
 import { Emitter } from '#/_base/event';
 import { ILogService } from '#/_base/log/log';
-import { IMcpOAuthStore } from '#/app/mcpConfig/oauthStore';
+import { IAgentIdentity } from '#/app/agentIdentity/agentIdentity';
+import { IMcpOAuthService } from '#/app/mcpConfig/oauthService';
+import { LifecycleScope } from '#/app/scopes';
 import type { McpServerConfig } from '#/mcpCore/config-schema';
+import { McpOAuthService } from '#/mcpCore/oauth/service';
+import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
+import { FakeRuntime } from '#/runtime/fakeRuntime';
+import { ISessionEphemeralMcpServers } from '#/session/mcp/ephemeralMcpServers';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionMcpService } from '#/session/sessionMcp/sessionMcp';
-import { SessionMcpService } from '#/session/sessionMcp/sessionMcpService';
 import { ISessionMcpServers } from '#/session/sessionMcp/sessionMcpServers';
+import { SessionMcpService } from '#/session/sessionMcp/sessionMcpService';
+import { IRuntimeResolver } from '#/workspace/workspaceInstance/workspaceInstanceManager';
 import type {
   McpServersChange,
   McpTunables,
 } from '#/workspace/workspaceMcpConfig/workspaceMcpConfig';
+import { stubAgentIdentity } from '../../app/agentIdentity/stubs';
 
 import { stubLog } from '../../_base/log/stubs';
-import { createMemoryMcpOAuthStore, startInProcessHttpMcpServer } from '../../mcpCore/stubs';
+import {
+  createMemoryMcpOAuthStore,
+  startInProcessHttpMcpServer,
+} from '../../mcpCore/stubs';
+
+function runtimeResolver(): IRuntimeResolver {
+  const runtime = Object.assign(
+    new FakeRuntime(
+      { workspaceId: 'ws_test', runtimeId: 'local', generation: 'test' },
+      { capabilities: ['process'] },
+    ),
+    { process: new HostProcessService() },
+  );
+  return {
+    _serviceBrand: undefined,
+    inspect: () => runtime,
+    acquire: () => ({ runtime, track: (resource) => resource, dispose: () => {} }),
+  };
+}
 
 describe('SessionMcpService', () => {
   let disposables: DisposableStore;
@@ -90,7 +105,13 @@ describe('SessionMcpService', () => {
       additionalServices: (reg) => {
         reg.defineInstance(ISessionContext, sessionContextStub());
         reg.defineInstance(ISessionMcpServers, seedStub());
-        reg.definePartialInstance(IMcpOAuthStore, createMemoryMcpOAuthStore());
+        reg.definePartialInstance(
+          IMcpOAuthService,
+          disposables.add(new McpOAuthService({ store: createMemoryMcpOAuthStore() })),
+        );
+        reg.defineInstance(IAgentIdentity, stubAgentIdentity());
+        reg.defineInstance(IRuntimeResolver, runtimeResolver());
+        reg.defineInstance(ISessionEphemeralMcpServers, {});
         reg.defineInstance(ILogService, stubLog());
         reg.define(ISessionMcpService, SessionMcpService);
       },
@@ -152,6 +173,22 @@ describe('SessionMcpService', () => {
     }
   }, 20000);
 
+  it('connects session stdio servers through the configured runtime', async () => {
+    current = {
+      perSession: {
+        transport: 'stdio',
+        command: process.execPath,
+        args: [stdioFixture],
+        cwd: tmpdir(),
+        scope: 'session',
+      },
+    };
+    const service = createService();
+    await service.ready;
+    expect(service.connectionManager.get('perSession')?.status).toBe('connected');
+    await service.connectionManager.shutdown();
+  });
+
   it('reads timeout tunables from the seed at connect', async () => {
     httpServer = await startInProcessHttpMcpServer();
     tunablesValue = { startupTimeoutMs: 4321, toolTimeoutMs: 9876 };
@@ -163,7 +200,13 @@ describe('SessionMcpService', () => {
       additionalServices: (reg) => {
         reg.defineInstance(ISessionContext, sessionContextStub());
         reg.defineInstance(ISessionMcpServers, { ...seedStub(), tunables });
-        reg.definePartialInstance(IMcpOAuthStore, createMemoryMcpOAuthStore());
+        reg.definePartialInstance(
+          IMcpOAuthService,
+          disposables.add(new McpOAuthService({ store: createMemoryMcpOAuthStore() })),
+        );
+        reg.defineInstance(IAgentIdentity, stubAgentIdentity());
+        reg.defineInstance(IRuntimeResolver, runtimeResolver());
+        reg.defineInstance(ISessionEphemeralMcpServers, {});
         reg.defineInstance(ILogService, stubLog());
         reg.define(ISessionMcpService, SessionMcpService);
       },
@@ -233,7 +276,13 @@ describe('SessionMcpService (scoped)', () => {
     const changes = new Emitter<McpServersChange>();
     const host = createScopedTestHost([
       stubPair(ILogService, stubLog()),
-      stubPair(IMcpOAuthStore, createMemoryMcpOAuthStore() as IMcpOAuthStore),
+      stubPair(
+        IMcpOAuthService,
+        new McpOAuthService({ store: createMemoryMcpOAuthStore() }),
+      ),
+      stubPair(IAgentIdentity, stubAgentIdentity()),
+      stubPair(IRuntimeResolver, runtimeResolver()),
+      stubPair(ISessionEphemeralMcpServers, {}),
     ]);
     try {
       const session = host.child(LifecycleScope.Session, 'sess_test', [
@@ -244,7 +293,8 @@ describe('SessionMcpService (scoped)', () => {
           sessionDir: '/tmp/kimi-session-mcp-test',
           metaScope: 'test',
           cwd: '/tmp/kimi-session-mcp-test',
-          scope: (subKey?: string) => (subKey === undefined ? 'test' : `test/${subKey}`),
+          scope: (subKey?: string) =>
+            subKey === undefined ? 'test' : `test/${subKey}`,
         }),
         stubPair(ISessionMcpServers, {
           _serviceBrand: undefined,

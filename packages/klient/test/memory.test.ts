@@ -1,16 +1,17 @@
+import { IAgentLifecycleService } from '@moonshot-ai/agent-core-v2';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { defineKlientConformance } from './helpers/conformance.js';
-import { getLiveSessionById } from '@moonshot-ai/agent-core-v2/app/workspaceLifecycle/sessionLookup';
-import { ISessionCronService } from '@moonshot-ai/agent-core-v2/session/cron/sessionCronService';
-import type { AgentHandle, Klient } from '../src/index.js';
-import { createKlient } from '../src/transports/memory/index.js';
-import { createMemoryDispatcher } from '../src/transports/memory/dispatcher.js';
+import { getLiveSessionById } from '@moonshot-ai/agent-core-v2/app/sessionManager/sessionLookup';
+import { IAgentCronService } from '@moonshot-ai/agent-core-v2/features/cron/cronService';
 import { RPCError } from '../src/core/errors.js';
+import type { AgentHandle, Klient } from '../src/index.js';
+import { createMemoryDispatcher } from '../src/transports/memory/dispatcher.js';
+import { createKlient } from '../src/transports/memory/index.js';
+import { defineKlientConformance } from './helpers/conformance.js';
 import { makeEngine, type TestEngine } from './helpers/engine.js';
 
 defineKlientConformance('memory', async () => {
@@ -22,7 +23,12 @@ defineKlientConformance('memory', async () => {
     cleanup: async () => {
       await klient.close();
       app.dispose();
-      await rm(homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+      await rm(homeDir, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 25,
+      });
     },
   };
 });
@@ -31,11 +37,15 @@ describe('memory dispatcher specifics', () => {
   it('rejects unknown services and methods with RPCError(40001)', async () => {
     const { homeDir, app } = await makeEngine();
     const dispatcher = createMemoryDispatcher(app);
-    await expect(dispatcher.call({}, 'noSuchService', 'get', [])).rejects.toMatchObject({
-      name: 'RPCError',
-      code: 40001,
-    });
-    await expect(dispatcher.call({}, 'sessionIndex', 'noSuchMethod', [])).rejects.toMatchObject({
+    await expect(dispatcher.call({}, 'noSuchService', 'get', [])).rejects.toMatchObject(
+      {
+        name: 'RPCError',
+        code: 40001,
+      },
+    );
+    await expect(
+      dispatcher.call({}, 'sessionIndex', 'noSuchMethod', []),
+    ).rejects.toMatchObject({
       name: 'RPCError',
       code: 40001,
     });
@@ -74,6 +84,68 @@ describe('memory dispatcher specifics', () => {
     app.dispose();
     await rm(homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
   });
+
+  it('does not respond to interactions owned by another session', async () => {
+    const { homeDir, app } = await makeEngine();
+    const klient = createKlient({ scope: app });
+    const dispatcher = createMemoryDispatcher(app);
+    const first = await klient.global.sessions.create({ workDir: process.cwd() });
+    const second = await klient.global.sessions.create({ workDir: process.cwd() });
+    try {
+      const parked = (await dispatcher.call(
+        { sessionId: first.id },
+        'sessionInteractionService',
+        'enqueue',
+        [
+          {
+            kind: 'approval',
+            payload: {
+              toolName: 'Bash',
+              action: 'run',
+              display: { kind: 'command', command: 'ls' },
+            },
+          },
+        ],
+      )) as { id: string };
+
+      await dispatcher.call(
+        { sessionId: second.id },
+        'sessionInteractionService',
+        'respond',
+        [parked.id, { decision: 'approved' }],
+      );
+      const pendingAfterCross = (await dispatcher.call(
+        { sessionId: first.id },
+        'sessionInteractionService',
+        'listPending',
+        ['approval'],
+      )) as readonly { id: string }[];
+      expect(pendingAfterCross.map((i) => i.id)).toEqual([parked.id]);
+
+      await dispatcher.call(
+        { sessionId: first.id },
+        'sessionInteractionService',
+        'respond',
+        [parked.id, { decision: 'approved' }],
+      );
+      const pendingAfterOwn = (await dispatcher.call(
+        { sessionId: first.id },
+        'sessionInteractionService',
+        'listPending',
+        ['approval'],
+      )) as readonly { id: string }[];
+      expect(pendingAfterOwn).toEqual([]);
+    } finally {
+      await klient.close();
+      app.dispose();
+      await rm(homeDir, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 25,
+      });
+    }
+  });
 });
 
 /**
@@ -94,10 +166,18 @@ describe('agent facade (real engine)', () => {
     await klient.global.config.replaceSections({
       sections: {
         providers: {
-          'agent-facade': { type: 'openai', baseUrl: 'http://127.0.0.1:1', apiKey: 'k' },
+          'agent-facade': {
+            type: 'openai',
+            baseUrl: 'http://127.0.0.1:1',
+            apiKey: 'k',
+          },
         },
         models: {
-          'agent-facade/m1': { provider: 'agent-facade', model: 'm1', maxContextSize: 8192 },
+          'agent-facade/m1': {
+            provider: 'agent-facade',
+            model: 'm1',
+            maxContextSize: 8192,
+          },
         },
         defaultModel: 'agent-facade/m1',
       },
@@ -113,7 +193,12 @@ describe('agent facade (real engine)', () => {
   afterAll(async () => {
     await klient.close();
     engine.app.dispose();
-    await rm(engine.homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    await rm(engine.homeDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 25,
+    });
   });
 
   it('drives the goal lifecycle through create/get/pause/resume/cancel', async () => {
@@ -192,7 +277,9 @@ describe('agent facade (real engine)', () => {
         (skill.type === undefined || skill.type === 'prompt' || skill.type === 'flow'),
     );
     expect(activatable).toBeDefined();
-    await expect(agent.activateSkill({ name: activatable!.name })).resolves.toBeDefined();
+    await expect(
+      agent.activateSkill({ name: activatable!.name }),
+    ).resolves.toBeDefined();
   });
 });
 
@@ -212,10 +299,18 @@ describe('session facade (real engine)', () => {
     await klient.global.config.replaceSections({
       sections: {
         providers: {
-          'session-facade': { type: 'openai', baseUrl: 'http://127.0.0.1:1', apiKey: 'k' },
+          'session-facade': {
+            type: 'openai',
+            baseUrl: 'http://127.0.0.1:1',
+            apiKey: 'k',
+          },
         },
         models: {
-          'session-facade/m1': { provider: 'session-facade', model: 'm1', maxContextSize: 8192 },
+          'session-facade/m1': {
+            provider: 'session-facade',
+            model: 'm1',
+            maxContextSize: 8192,
+          },
         },
         defaultModel: 'session-facade/m1',
       },
@@ -230,7 +325,12 @@ describe('session facade (real engine)', () => {
   afterAll(async () => {
     await klient.close();
     engine.app.dispose();
-    await rm(engine.homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    await rm(engine.homeDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 25,
+    });
   });
 
   it('starts a btw side-question agent off the main agent', async () => {
@@ -258,7 +358,9 @@ describe('session facade (real engine)', () => {
     for (const server of servers) {
       expect(typeof server.name).toBe('string');
       expect(['stdio', 'http', 'sse']).toContain(server.transport);
-      expect(['pending', 'connected', 'failed', 'disabled', 'needs-auth']).toContain(server.status);
+      expect(['pending', 'connected', 'failed', 'disabled', 'needs-auth']).toContain(
+        server.status,
+      );
       expect(typeof server.toolCount).toBe('number');
     }
 
@@ -278,9 +380,9 @@ describe('session facade (real engine)', () => {
       expect(process.cwd().startsWith(result.projectRoot)).toBe(true);
       // Path resolution may normalize (e.g. macOS /var symlinks) — compare on
       // the unique trailing segment.
-      expect(result.additionalDirs.some((added) => added.endsWith(dir.split('/').pop()!))).toBe(
-        true,
-      );
+      expect(
+        result.additionalDirs.some((added) => added.endsWith(dir.split('/').pop()!)),
+      ).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
     }
@@ -298,10 +400,18 @@ describe('session facade cron & secondary model (real engine)', () => {
     await klient.global.config.replaceSections({
       sections: {
         providers: {
-          'cron-secondary': { type: 'openai', baseUrl: 'http://127.0.0.1:1', apiKey: 'k' },
+          'cron-secondary': {
+            type: 'openai',
+            baseUrl: 'http://127.0.0.1:1',
+            apiKey: 'k',
+          },
         },
         models: {
-          'cron-secondary/m1': { provider: 'cron-secondary', model: 'm1', maxContextSize: 8192 },
+          'cron-secondary/m1': {
+            provider: 'cron-secondary',
+            model: 'm1',
+            maxContextSize: 8192,
+          },
         },
         defaultModel: 'cron-secondary/m1',
       },
@@ -316,7 +426,12 @@ describe('session facade cron & secondary model (real engine)', () => {
   afterAll(async () => {
     await klient.close();
     engine.app.dispose();
-    await rm(engine.homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    await rm(engine.homeDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 25,
+    });
   });
 
   it('lists cron tasks with their next fire times', async () => {
@@ -325,8 +440,15 @@ describe('session facade cron & secondary model (real engine)', () => {
 
     const live = getLiveSessionById(engine.app.accessor, sessionId);
     expect(live).toBeDefined();
-    const cron = live!.accessor.get(ISessionCronService);
-    const created = cron.addTask({ cron: '*/5 * * * *', prompt: 'ping', recurring: true });
+    const cron = live!.accessor
+      .get(IAgentLifecycleService)
+      .handleOf('main')!
+      .accessor.get(IAgentCronService);
+    const created = cron.addTask({
+      cron: '*/5 * * * *',
+      prompt: 'ping',
+      recurring: true,
+    });
 
     const { tasks } = await session.getCronTasks();
     const found = tasks.find((task) => task.id === created.id);
@@ -335,24 +457,6 @@ describe('session facade cron & secondary model (real engine)', () => {
     expect(found!.prompt).toBe('ping');
     // A recurring every-5-minutes schedule always has a future fire.
     expect(typeof found!.nextFireAt).toBe('number');
-  });
-
-  it('rejects applyPersistedSecondaryModel without a persisted recipe', async () => {
-    await expect(klient.session(sessionId).applyPersistedSecondaryModel()).rejects.toThrow(
-      /persist its recipe/,
-    );
-  });
-
-  it('rejects an unknown secondary model, then applies a configured one', async () => {
-    const session = klient.session(sessionId);
-    await klient.global.config.set({ domain: 'secondaryModel', patch: { model: 'no-such-model' } });
-    await expect(session.applyPersistedSecondaryModel()).rejects.toThrow(/not configured/);
-
-    await klient.global.config.set({
-      domain: 'secondaryModel',
-      patch: { model: 'cron-secondary/m1' },
-    });
-    await expect(session.applyPersistedSecondaryModel()).resolves.toBeUndefined();
   });
 });
 
@@ -374,10 +478,18 @@ describe('sdk-migration facade additions (real engine)', () => {
     await klient.global.config.replaceSections({
       sections: {
         providers: {
-          'sdk-migration': { type: 'openai', baseUrl: 'http://127.0.0.1:1', apiKey: 'k' },
+          'sdk-migration': {
+            type: 'openai',
+            baseUrl: 'http://127.0.0.1:1',
+            apiKey: 'k',
+          },
         },
         models: {
-          'sdk-migration/m1': { provider: 'sdk-migration', model: 'm1', maxContextSize: 8192 },
+          'sdk-migration/m1': {
+            provider: 'sdk-migration',
+            model: 'm1',
+            maxContextSize: 8192,
+          },
         },
         defaultModel: 'sdk-migration/m1',
       },
@@ -392,7 +504,12 @@ describe('sdk-migration facade additions (real engine)', () => {
   afterAll(async () => {
     await klient.close();
     engine.app.dispose();
-    await rm(engine.homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    await rm(engine.homeDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 25,
+    });
   });
 
   it('binds the default profile and exposes the profile snapshot', async () => {
@@ -429,7 +546,6 @@ describe('sdk-migration facade additions (real engine)', () => {
     expect((await agent.getLoopStatus()).state).toBe('idle');
     const activity = await agent.getActivityState();
     expect(activity.turn).toBeUndefined();
-    expect(Array.isArray(activity.background)).toBe(true);
     expect(await agent.getCompacting()).toBeUndefined();
   });
 
@@ -462,7 +578,9 @@ describe('sdk-migration facade additions (real engine)', () => {
         (skill.type === undefined || skill.type === 'prompt' || skill.type === 'flow'),
     );
     expect(activatable).toBeDefined();
-    await expect(agent.activateSkillAwaited(activatable!.name)).resolves.toBeUndefined();
+    await expect(
+      agent.activateSkillAwaited(activatable!.name),
+    ).resolves.toBeUndefined();
   });
 
   it('rejects an unknown plugin command and reconnects an unknown MCP server', async () => {
@@ -473,7 +591,6 @@ describe('sdk-migration facade additions (real engine)', () => {
     await expect(
       klient.session(sessionId).reconnectMcpServer('no-such-server'),
     ).rejects.toThrow(/Unknown MCP server|not found|disabled/i);
-    await expect(klient.session(sessionId).recheckSecondaryModelWarning()).resolves.toBeUndefined();
   });
 
   it('stops and waits for unknown tasks without stamping a reason', async () => {
@@ -482,7 +599,9 @@ describe('sdk-migration facade additions (real engine)', () => {
       agent.stopTaskWithReason({ taskId: 'no-such-task' }),
     ).resolves.toBeUndefined();
     await expect(agent.waitForTask('no-such-task', 25)).resolves.toBeUndefined();
-    await expect(agent.suppressTaskTerminalNotification('no-such-task')).resolves.toBeUndefined();
+    await expect(
+      agent.suppressTaskTerminalNotification('no-such-task'),
+    ).resolves.toBeUndefined();
   });
 
   it('materializes agents and lists the live roster', async () => {
@@ -509,7 +628,10 @@ describe('sdk-migration facade additions (real engine)', () => {
     expect(await session.resume()).toBe(true);
     expect(await session.isLive()).toBe(true);
 
-    const forked = await session.fork({ newSessionId: 'sdk-migration-fork', title: 'fork' });
+    const forked = await session.fork({
+      newSessionId: 'sdk-migration-fork',
+      title: 'fork',
+    });
     expect(forked.id).toBe('sdk-migration-fork');
     expect((await klient.global.sessions.get('sdk-migration-fork'))?.id).toBe(
       'sdk-migration-fork',
@@ -587,5 +709,65 @@ describe('sdk-migration facade additions (real engine)', () => {
 
   it('resolves the relative persistence scope names', async () => {
     expect(await klient.global.envScope('sessions')).toBe('sessions');
+  });
+
+  it('rejects replacing an ephemeral MCP name with a session-owned connection', async () => {
+    const created = await klient.global.sessions.create({
+      workDir: process.cwd(),
+      mcpServers: {
+        isolated: {
+          transport: 'http',
+          url: 'http://127.0.0.1:1/mcp',
+          enabled: false,
+        },
+      },
+    });
+    const session = klient.session(created.id);
+    try {
+      await expect(
+        session.replaceMcpServer('isolated', {
+          name: 'isolated',
+          transport: 'http',
+          url: 'http://127.0.0.1:1/other',
+          scope: 'session',
+        }),
+      ).rejects.toThrow(/Ephemeral/);
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('rejects a live MCP scope change before persisting the replacement', async () => {
+    await klient.global.mcp.add({
+      server: {
+        name: 'scope-guard',
+        transport: 'http',
+        url: 'http://127.0.0.1:1/mcp',
+        enabled: false,
+      },
+      cwd: process.cwd(),
+    });
+    const created = await klient.global.sessions.create({ workDir: process.cwd() });
+    const session = klient.session(created.id);
+    try {
+      await session.getMcpStartupMetrics();
+      await expect(
+        session.addMcpServer(
+          {
+            name: 'scope-guard',
+            transport: 'http',
+            url: 'http://127.0.0.1:1/other',
+            scope: 'session',
+          },
+          true,
+        ),
+      ).rejects.toThrow(/Cannot change the scope/);
+      expect(
+        (await klient.global.mcp.get({ name: 'scope-guard' })).config,
+      ).toMatchObject({ url: 'http://127.0.0.1:1/mcp', enabled: false });
+    } finally {
+      await session.close();
+      await klient.global.mcp.remove({ name: 'scope-guard' });
+    }
   });
 });

@@ -1,6 +1,6 @@
 /**
  * `agentGoalService` — the main-agent goal lifecycle contract. Mirrors
- * `agent-core-v2/agent/goal/goal.ts` (`IAgentGoalService`) and the wire types
+ * `agent-core-v2/features/goal/goal.ts` (`IAgentGoalService`) and the wire types
  * in `agent/goal/types.ts`. The optional trailing `actor` parameter never
  * crosses the wire (the facade always acts as the default `'user'` actor), so
  * the input tuples stop at the payload argument.

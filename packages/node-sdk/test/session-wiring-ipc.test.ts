@@ -13,20 +13,25 @@ import { join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import type { ApprovalResponse } from '#/interaction';
 import {
   bootstrap,
   getLiveSessionById,
-  ISessionApprovalService,
-  ISessionQuestionService,
+  IAgentLifecycleService,
+  interactions,
   logSeed,
   MAIN_AGENT_ID,
   resolveLoggingConfig,
 } from '@moonshot-ai/agent-core-v2';
-import { ensureMainAgent } from '@moonshot-ai/agent-core-v2/session/agentLifecycle/mainAgent';
 import { IEventBus } from '@moonshot-ai/agent-core-v2/app/event/eventBus';
-import type { ApprovalResponse, Event } from '@moonshot-ai/agent-core';
-import { createKlient, serveKlientIpc, type KlientIpcHost } from '@moonshot-ai/klient/ipc';
+import type { Event } from '@moonshot-ai/agent-core-v2/events';
+import { ensureMainAgent } from '@moonshot-ai/agent-core-v2/session/agentLifecycle/mainAgent';
 import type { Klient } from '@moonshot-ai/klient';
+import {
+  createKlient,
+  serveKlientIpc,
+  type KlientIpcHost,
+} from '@moonshot-ai/klient/ipc';
 
 import { SessionEventWiring, type SessionEventSink } from '#/v2/session-wiring';
 
@@ -36,7 +41,11 @@ const TEST_CLIENT_IDENTITY = {
   platform: 'test',
 } as const;
 
-async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs: number,
+  label: string,
+): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (predicate()) return;
@@ -81,7 +90,10 @@ describe('SessionEventWiring over ipc', () => {
     ({ app } = bootstrap({ homeDir, clientIdentity: TEST_CLIENT_IDENTITY }, [
       ...logSeed(resolveLoggingConfig({ homeDir, env: process.env })),
     ]));
-    host = await serveKlientIpc({ scope: app, socketPath: join(homeDir, 'klient.sock') });
+    host = await serveKlientIpc({
+      scope: app,
+      socketPath: join(homeDir, 'klient.sock'),
+    });
     klient = createKlient({ socketPath: host.socketPath });
 
     await klient.global.config.replaceSections({
@@ -90,12 +102,19 @@ describe('SessionEventWiring over ipc', () => {
           'wiring-ipc': { type: 'openai', baseUrl: 'http://127.0.0.1:1', apiKey: 'k' },
         },
         models: {
-          'wiring-ipc/m1': { provider: 'wiring-ipc', model: 'm1', maxContextSize: 8192 },
+          'wiring-ipc/m1': {
+            provider: 'wiring-ipc',
+            model: 'm1',
+            maxContextSize: 8192,
+          },
         },
         defaultModel: 'wiring-ipc/m1',
       },
     });
-    const created = await klient.global.sessions.create({ workDir, title: 'wiring ipc' });
+    const created = await klient.global.sessions.create({
+      workDir,
+      title: 'wiring ipc',
+    });
     sessionId = created.id;
     // Materialize the main agent before bus events are published.
     await klient.session(sessionId).agent(MAIN_AGENT_ID).getModel();
@@ -114,23 +133,29 @@ describe('SessionEventWiring over ipc', () => {
   it('bridges a parked approval across the socket and resolves the engine requester', async () => {
     const session = getLiveSessionById(app.accessor, sessionId);
     expect(session).toBeDefined();
-    const approvals = session!.accessor.get(ISessionApprovalService);
-    const requester = approvals.request({
-      toolName: 'Bash',
-      action: 'run',
-      display: { kind: 'shell', command: 'ls' } as never,
+    const requester = interactions.request({
+      kind: 'approval',
+      tags: { sessionId, agentId: MAIN_AGENT_ID },
+      payload: {
+        toolName: 'Bash',
+        action: 'run',
+        display: { kind: 'shell', command: 'ls' } as never,
+      },
     });
     const response = await requester;
     expect(response).toEqual({ decision: 'approved' });
     expect(approvalTools).toContain('Bash');
-    expect(approvals.listPending()).toEqual([]);
+    expect(interactions.findAll({ resolved: false, tags: { sessionId } })).toEqual([]);
   }, 30_000);
 
   it('bridges a parked question across the socket and resolves the engine requester', async () => {
     const session = getLiveSessionById(app.accessor, sessionId);
-    const questions = session!.accessor.get(ISessionQuestionService);
-    const result = await questions.request({
-      questions: [{ question: 'pick one', options: [{ label: 'a' }] }] as never,
+    const result = await interactions.request({
+      kind: 'question',
+      tags: { sessionId, agentId: MAIN_AGENT_ID },
+      payload: {
+        questions: [{ question: 'pick one', options: [{ label: 'a' }] }] as never,
+      },
     });
     expect(result).toEqual({ answers: { 'pick one': 'a' } });
     expect(questionTexts).toContain('pick one');
@@ -138,7 +163,10 @@ describe('SessionEventWiring over ipc', () => {
 
   it('forwards raw agent bus events across the socket with v1 stamping', async () => {
     const session = getLiveSessionById(app.accessor, sessionId);
-    const agent = await ensureMainAgent(session!);
+    await ensureMainAgent(session!);
+    const agent = session!.accessor
+      .get(IAgentLifecycleService)
+      .handleOf(MAIN_AGENT_ID)!;
     const before = events.length;
     agent.accessor.get(IEventBus).publish({
       type: 'assistant.delta',
@@ -146,7 +174,7 @@ describe('SessionEventWiring over ipc', () => {
       delta: 'over-the-wire',
     } as never);
     await waitFor(() => events.length > before, 10_000, 'assistant.delta over ipc');
-    const last = events[events.length - 1]!;
+    const last = events.at(-1)!;
     expect(last).toMatchObject({
       type: 'assistant.delta',
       sessionId,
@@ -154,4 +182,64 @@ describe('SessionEventWiring over ipc', () => {
       delta: 'over-the-wire',
     });
   }, 30_000);
+
+  it('forwards the first event of a newly materialized subagent', async () => {
+    const session = getLiveSessionById(app.accessor, sessionId)!;
+    const lifecycle = session.accessor.get(IAgentLifecycleService);
+    const context = await lifecycle.create({ agentId: 'late-agent' });
+    const agent = lifecycle.handleOf(context.agentId)!;
+    agent.accessor.get(IEventBus).publish({
+      type: 'assistant.delta',
+      turnId: 1,
+      delta: 'first-late-event',
+    } as never);
+    await waitFor(
+      () =>
+        events.some(
+          (event) =>
+            event.type === 'assistant.delta' && event.delta === 'first-late-event',
+        ),
+      10_000,
+      'new agent event',
+    );
+    expect(
+      events.find(
+        (event) =>
+          event.type === 'assistant.delta' && event.delta === 'first-late-event',
+      ),
+    ).toMatchObject({ sessionId, agentId: 'late-agent' });
+    await lifecycle.remove(context);
+  });
+
+  it('rebinds a subagent stream after the same id is recreated', async () => {
+    const session = getLiveSessionById(app.accessor, sessionId)!;
+    const lifecycle = session.accessor.get(IAgentLifecycleService);
+    const first = await lifecycle.create({ agentId: 'recreated-agent' });
+    await lifecycle.remove(first);
+    const recreated = await lifecycle.create({ agentId: 'recreated-agent' });
+    lifecycle
+      .handleOf(recreated.agentId)!
+      .accessor.get(IEventBus)
+      .publish({
+        type: 'assistant.delta',
+        turnId: 1,
+        delta: 'recreated-event',
+      } as never);
+    await waitFor(
+      () =>
+        events.some(
+          (event) =>
+            event.type === 'assistant.delta' && event.delta === 'recreated-event',
+        ),
+      10_000,
+      'recreated agent event',
+    );
+    expect(
+      events.find(
+        (event) =>
+          event.type === 'assistant.delta' && event.delta === 'recreated-event',
+      ),
+    ).toMatchObject({ sessionId, agentId: 'recreated-agent' });
+    await lifecycle.remove(recreated);
+  });
 });

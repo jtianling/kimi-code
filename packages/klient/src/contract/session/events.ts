@@ -10,14 +10,11 @@ import { z } from 'zod';
 import type {
   Interaction,
   InteractionResolution,
-} from '@moonshot-ai/agent-core-v2/session/interaction/interaction';
+} from '@moonshot-ai/agent-core-v2/human/interaction/interaction';
 import type { SessionMetadataChangedEvent } from '@moonshot-ai/agent-core-v2/session/sessionMetadata/sessionMetadata';
 
 import type { EventRegistration } from '../types.js';
-import {
-  interactionResolutionSchema,
-  interactionSchema,
-} from './interaction.js';
+import { interactionResolutionSchema, interactionSchema } from './interaction.js';
 import { sessionMetadataChangedEventSchema } from './metadata.js';
 
 /**
@@ -36,6 +33,10 @@ type SessionEventRegistration = EventRegistration | StreamEventRegistration;
 
 /** Public event name → payload type. Keys must stay in sync with `sessionEvents`. */
 export interface SessionEventPayloads {
+  'agents.raw': {
+    readonly agentId: string;
+    readonly event: { readonly type: string; readonly [key: string]: unknown };
+  };
   'metadata.changed': SessionMetadataChangedEvent;
   'interactions.changed': readonly Interaction[];
   'interactions.resolved': InteractionResolution;
@@ -47,6 +48,14 @@ export type SessionEventName = keyof SessionEventPayloads;
 
 /** Public event name → source binding + payload schema. */
 export const sessionEvents = {
+  'agents.raw': {
+    kind: 'stream',
+    name: 'agents',
+    schema: z.object({
+      agentId: z.string(),
+      event: z.looseObject({ type: z.string() }),
+    }),
+  },
   'metadata.changed': {
     kind: 'emitter',
     service: 'sessionMetadata',

@@ -5,7 +5,7 @@
 
 import { z } from 'zod';
 
-import { maybe, noResult } from '../helpers.js';
+import { maybe,noResult } from '../helpers.js';
 import type { ServiceContract } from '../types.js';
 
 export const workspaceSchema = z.object({

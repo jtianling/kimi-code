@@ -1,3 +1,4 @@
+import { mcpServerConfigSchema } from '../mcp.js';
 /**
  * `agentMcpService` — the agent-scope read view over the workspace handler's
  * one shared `McpConnectionManager`. Mirrors `agent-core-v2/agent/mcp/mcp.ts`
@@ -41,4 +42,11 @@ export const agentMcpContract = {
   initialLoadDurationMs: { input: z.tuple([]), output: z.number() },
   // The optional `AbortSignal` never crosses the wire.
   reconnect: { input: z.tuple([z.string()]), output: noResult },
+} satisfies ServiceContract;
+
+const namedServerSchema = mcpServerConfigSchema.and(z.object({ name: z.string() }));
+
+export const sessionMcpManagementContract = {
+  replace: { input: z.tuple([z.string(), namedServerSchema]), output: noResult },
+  add: { input: z.tuple([namedServerSchema, z.boolean().optional()]), output: mcpServerEntrySchema },
 } satisfies ServiceContract;

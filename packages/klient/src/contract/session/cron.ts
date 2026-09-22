@@ -3,14 +3,14 @@
  * panel needs crosses the wire (`list` + per-task next fire); mutations stay
  * tool-driven, and pure computation (`computeDisplayNextFire`,
  * `ParsedCronExpression`) stays client-side. Mirrors
- * `agent-core-v2/session/cron/sessionCronService.ts`.
+ * `agent-core-v2/features/cron/cronService.ts`.
  */
 
 import { z } from 'zod';
 
 import type { ServiceContract } from '../types.js';
 
-/** `CronTask` (`agent-core-v2/app/cron/cronTask.ts`). */
+/** `CronTask` (`agent-core-v2/features/cron/cronTask.ts`). */
 export const cronTaskSchema = z.object({
   id: z.string(),
   cron: z.string(),

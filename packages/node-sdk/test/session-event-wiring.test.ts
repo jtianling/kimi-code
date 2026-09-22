@@ -1,3 +1,4 @@
+import type { Event } from '@moonshot-ai/agent-core-v2/events';
 /**
  * `SessionEventWiring` — the facade-driven v1 edge over the v2 event stream
  * and interaction kernel. Covers the status-snapshot fold (usage + context +
@@ -9,12 +10,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import type {
-  ApprovalRequest,
-  ApprovalResponse,
-  Event,
-  QuestionResult,
-} from '@moonshot-ai/agent-core';
+import type { ApprovalRequest, ApprovalResponse, QuestionResult } from '#/interaction';
 import type { Interaction } from '@moonshot-ai/agent-core-v2';
 import type { AgentHandle, SessionHandle } from '@moonshot-ai/klient';
 
@@ -44,6 +40,10 @@ class FakeEventHub {
     };
   }
 
+  onError(_listener: (error: Error) => void): { dispose(): void } {
+    return { dispose() {} };
+  }
+
   emit(event: string, payload: unknown): void {
     for (const listener of [...(this.handlers.get(event) ?? [])]) {
       (listener as (p: unknown) => void)(payload);
@@ -66,7 +66,9 @@ function makeAgent(id: string, options: FakeAgentOptions = {}): AgentHandle {
   return {
     id,
     events,
-    getUsage: incomplete ? () => Promise.reject(new Error('dead')) : () => Promise.resolve(USAGE),
+    getUsage: incomplete
+      ? () => Promise.reject(new Error('dead'))
+      : () => Promise.resolve(USAGE),
     getStatusContextSize: incomplete
       ? () => Promise.reject(new Error('dead'))
       : () => Promise.resolve(10),
@@ -90,14 +92,21 @@ interface FakeSession {
   setPending(pending: readonly Interaction[]): void;
 }
 
-function makeSession(agentIds: string[], agentOptions: FakeAgentOptions = {}): FakeSession {
+function makeSession(
+  agentIds: string[],
+  agentOptions: FakeAgentOptions = {},
+): FakeSession {
   const sessionEvents = new FakeEventHub();
   const agentEvents = new Map<string, FakeEventHub>();
   const agentHandles = new Map<string, AgentHandle>();
   for (const id of agentIds) {
     const handle = makeAgent(id, agentOptions);
     agentHandles.set(id, handle);
-    agentEvents.set(id, (handle as unknown as { events: FakeEventHub }).events);
+    const events = (handle as unknown as { events: FakeEventHub }).events;
+    agentEvents.set(id, events);
+    events.on('events.raw', (event) =>
+      sessionEvents.emit('agents.raw', { agentId: id, event }),
+    );
   }
   const fake: FakeSession = {
     sessionEvents,
@@ -150,7 +159,9 @@ function collectingSink(overrides: Partial<SessionEventSink> = {}): {
   approvalRequests: Array<ApprovalRequest & { sessionId: string; agentId: string }>;
 } {
   const events: Event[] = [];
-  const approvalRequests: Array<ApprovalRequest & { sessionId: string; agentId: string }> = [];
+  const approvalRequests: Array<
+    ApprovalRequest & { sessionId: string; agentId: string }
+  > = [];
   return {
     events,
     approvalRequests,
@@ -193,7 +204,13 @@ describe('SessionEventWiring status snapshot fold', () => {
         type: 'agent.status.updated',
         usage: USAGE,
       });
-      session.agentEvents.get('agent-1')!.emit('events.raw', { type: 'assistant.delta', delta: 'Hi' });
+      session.agentEvents
+        .get('agent-1')!
+        .emit('events.raw', {
+          type: 'assistant.delta',
+          delta: 'Hi',
+          time: 1_700_000_000_123,
+        });
       await flush();
     } finally {
       wiring.dispose();
@@ -207,9 +224,14 @@ describe('SessionEventWiring status snapshot fold', () => {
       usage: USAGE,
       contextTokens: 10,
       maxContextTokens: 128_000,
+      contextUsage: 10 / 128_000,
       model: 'sub-model',
     });
-    expect(events[1]).toMatchObject({ type: 'assistant.delta', delta: 'Hi' });
+    expect(events[1]).toMatchObject({
+      type: 'assistant.delta',
+      delta: 'Hi',
+      time: 1_700_000_000_123,
+    });
     expect(events[1]).not.toHaveProperty('model');
   });
 
@@ -219,7 +241,9 @@ describe('SessionEventWiring status snapshot fold', () => {
     const wiring = new SessionEventWiring(session.handle, 's1', sink);
     try {
       await flush();
-      session.agentEvents.get('agent-1')!.emit('events.raw', { type: 'agent.status.updated' });
+      session.agentEvents
+        .get('agent-1')!
+        .emit('events.raw', { type: 'agent.status.updated' });
       await flush();
     } finally {
       wiring.dispose();
@@ -247,6 +271,38 @@ describe('SessionEventWiring status snapshot fold', () => {
     expect(events[0]).toMatchObject({ type: 'agent.status.updated', usage: USAGE });
     expect(events[0]).not.toHaveProperty('model');
   });
+
+  it('strips the internal promptAttachments field from turn.started', async () => {
+    const session = makeSession(['agent-1']);
+    const { sink, events } = collectingSink();
+    const wiring = new SessionEventWiring(session.handle, 's1', sink);
+    try {
+      // `promptAttachments` is transcript-projection metadata: kap-server
+      // strips it from the WS wire event, so SDK consumers must not see it
+      // either.
+      await flush();
+      session.agentEvents.get('agent-1')!.emit('events.raw', {
+        type: 'turn.started',
+        turnId: 1,
+        origin: { kind: 'user' },
+        prompt: 'describe this',
+        promptAttachments: [{ kind: 'image', fileId: 'f_1' }],
+      });
+      await flush();
+    } finally {
+      wiring.dispose();
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: 'turn.started',
+      turnId: 1,
+      sessionId: 's1',
+      agentId: 'agent-1',
+      prompt: 'describe this',
+    });
+    expect(events[0]).not.toHaveProperty('promptAttachments');
+  });
 });
 
 describe('SessionEventWiring interaction bridge', () => {
@@ -254,7 +310,7 @@ describe('SessionEventWiring interaction bridge', () => {
     id: 'appr-1',
     kind: 'approval',
     createdAt: 1,
-    origin: { agentId: 'main', turnId: 7 },
+    tags: { agentId: 'main', turnId: 7 },
     payload: {
       toolName: 'Bash',
       action: 'run',
@@ -281,7 +337,9 @@ describe('SessionEventWiring interaction bridge', () => {
       toolName: 'Bash',
       toolCallId: 'call-1',
     });
-    expect(session.approvalsDecided).toEqual([{ id: 'appr-1', response: { decision: 'approved' } }]);
+    expect(session.approvalsDecided).toEqual([
+      { id: 'appr-1', response: { decision: 'approved' } },
+    ]);
   });
 
   it('bridges each pending interaction exactly once across repeated full-set pushes', async () => {
@@ -305,12 +363,16 @@ describe('SessionEventWiring interaction bridge', () => {
       id: 'q-1',
       kind: 'question',
       createdAt: 1,
-      origin: { agentId: 'main', turnId: 7 },
+      tags: { agentId: 'main', turnId: 7 },
       payload: { turnId: 7, questions: [{ question: 'pick one', options: [] }] },
     } as unknown as Interaction;
 
     const nullSession = makeSession([]);
-    const nullWiring = new SessionEventWiring(nullSession.handle, 's1', collectingSink().sink);
+    const nullWiring = new SessionEventWiring(
+      nullSession.handle,
+      's1',
+      collectingSink().sink,
+    );
     nullSession.setPending([questionInteraction]);
     await flush();
     nullWiring.dispose();
@@ -337,7 +399,7 @@ describe('SessionEventWiring interaction bridge', () => {
       id: 'ut-1',
       kind: 'user_tool',
       createdAt: 1,
-      origin: { agentId: 'main', turnId: 7 },
+      tags: { agentId: 'main', turnId: 7 },
       payload: { turnId: 7, toolCallId: 'call-9', name: 'custom', args: {} },
     } as unknown as Interaction;
 

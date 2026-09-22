@@ -1,13 +1,5 @@
-/**
- * `mcpCore` domain — remote (HTTP/SSE) server config guards and request-header builders.
- *
- * Header values support `${VAR}` templates resolved through the caller-provided
- * env lookup; a value whose any variable resolves to undefined or empty drops
- * the whole header, so a literal `${...}` never reaches the wire.
- */
-
-import type { McpRemoteServerConfig, McpServerConfig } from './config-schema';
-import { ErrorCodes, Error2 } from '#/errors';
+import { Error2,ErrorCodes } from '#/errors';
+import type { McpRemoteServerConfig,McpServerConfig } from './config-schema';
 
 const ENV_TEMPLATE_PATTERN = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 

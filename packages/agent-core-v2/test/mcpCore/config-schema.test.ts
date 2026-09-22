@@ -1,12 +1,6 @@
-/**
- * Scenario: MCP server config schema — transport inference and the optional
- * `scope` field selecting the connection lifetime (default workspace-shared,
- * opt-in per-session).
- * Run: `pnpm --filter @moonshot-ai/agent-core-v2 exec vitest run
- * test/mcpCore/config-schema.test.ts`.
- */
 
-import { describe, expect, it } from 'vitest';
+
+import { describe,expect,it } from 'vitest';
 
 import { McpServerConfigSchema } from '#/mcpCore/config-schema';
 
